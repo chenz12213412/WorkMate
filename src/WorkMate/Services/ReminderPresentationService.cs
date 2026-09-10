@@ -1,0 +1,370 @@
+using System.Windows;
+using System.Windows.Threading;
+using WorkMate.Infrastructure;
+using WorkMate.Models;
+
+namespace WorkMate.Services;
+
+public interface IReminderPresentationService : IDisposable
+{
+    void ApplySettings(ReminderPresentationSettings settings);
+
+    Task EnqueueAsync(ReminderPresentationRequest request, CancellationToken cancellationToken);
+
+    void SetSystemAvailable(bool available);
+}
+
+public sealed class ReminderPresentationService : IReminderPresentationService
+{
+    public static readonly TimeSpan MinimumReminderGap = TimeSpan.FromMinutes(3);
+
+    private readonly object _syncRoot = new();
+    private readonly List<QueuedReminder> _queue = [];
+    private readonly Dispatcher _dispatcher;
+    private readonly SpeechService _speechService;
+    private readonly IIconService _iconService;
+    private readonly SpeechTemplateProvider _speechTemplateProvider = new();
+    private readonly CancellationTokenSource _disposeTokenSource = new();
+    private CancellationTokenSource? _queueDelayTokenSource;
+    private ReminderPopupWindow? _currentPopup;
+    private ReminderPriority? _currentPriority;
+    private DateTimeOffset? _lastShownAt;
+    private long _sequence;
+    private int _processing;
+    private bool _systemAvailable = true;
+    private bool _disposed;
+    private ReminderPresentationSettings _settings = ReminderPresentationSettings.Default;
+
+    public ReminderPresentationService(
+        Dispatcher dispatcher,
+        SpeechService speechService,
+        IIconService iconService)
+    {
+        _dispatcher = dispatcher;
+        _speechService = speechService;
+        _iconService = iconService;
+    }
+
+    public event Action<ReminderIconType>? ReminderStarted;
+
+    public event Action? ReminderEnded;
+
+    public void ApplySettings(ReminderPresentationSettings settings)
+    {
+        _settings = settings;
+        _speechService.UpdateSettings(
+            settings.GlobalSpeechEnabled,
+            settings.SpeechVolume,
+            settings.SpeechRate,
+            settings.SpeechVoiceName);
+    }
+
+    public Task EnqueueAsync(ReminderPresentationRequest request, CancellationToken cancellationToken)
+    {
+        cancellationToken.ThrowIfCancellationRequested();
+        if (_disposed || request.ExpiresAt <= DateTimeOffset.Now)
+        {
+            return Task.CompletedTask;
+        }
+
+        lock (_syncRoot)
+        {
+            if (_queue.Any(item => string.Equals(
+                    item.Request.HistoryType,
+                    request.HistoryType,
+                    StringComparison.Ordinal)))
+            {
+                return Task.CompletedTask;
+            }
+
+            _queue.Add(new QueuedReminder(request, Interlocked.Increment(ref _sequence)));
+            if (request.Priority == ReminderPriority.ScheduleCritical)
+            {
+                _queueDelayTokenSource?.Cancel();
+                if (_currentPriority is { } priority && priority < ReminderPriority.ScheduleCritical)
+                {
+                    _dispatcher.BeginInvoke(() =>
+                    {
+                        _speechService.Stop();
+                        _currentPopup?.CloseForPreemption();
+                    });
+                }
+            }
+        }
+
+        StartProcessor();
+        return Task.CompletedTask;
+    }
+
+    public void SetSystemAvailable(bool available)
+    {
+        if (_disposed)
+        {
+            return;
+        }
+
+        lock (_syncRoot)
+        {
+            _systemAvailable = available;
+            if (!available)
+            {
+                _speechService.Stop();
+                _dispatcher.BeginInvoke(() => _currentPopup?.CloseForPreemption());
+            }
+        }
+
+        if (available)
+        {
+            StartProcessor();
+        }
+    }
+
+    public void Dispose()
+    {
+        if (_disposed)
+        {
+            return;
+        }
+
+        _disposed = true;
+        _disposeTokenSource.Cancel();
+        lock (_syncRoot)
+        {
+            _queue.Clear();
+            _queueDelayTokenSource?.Cancel();
+        }
+
+        _speechService.Stop();
+        if (_dispatcher.CheckAccess())
+        {
+            _currentPopup?.CloseForPreemption();
+        }
+        else
+        {
+            _dispatcher.BeginInvoke(() => _currentPopup?.CloseForPreemption());
+        }
+
+        _disposeTokenSource.Dispose();
+        _queueDelayTokenSource?.Dispose();
+    }
+
+    private void StartProcessor()
+    {
+        if (_disposed || Interlocked.CompareExchange(ref _processing, 1, 0) != 0)
+        {
+            return;
+        }
+
+        _dispatcher.BeginInvoke(() => _ = ProcessQueueAsync());
+    }
+
+    private async Task ProcessQueueAsync()
+    {
+        try
+        {
+            while (!_disposed)
+            {
+                var request = TakeNextRequest();
+                if (request is null)
+                {
+                    return;
+                }
+
+                if (!_systemAvailable)
+                {
+                    Requeue(request);
+                    await DelayQueueAsync(TimeSpan.FromSeconds(5));
+                    continue;
+                }
+
+                var now = DateTimeOffset.Now;
+                if (request.ExpiresAt <= now)
+                {
+                    continue;
+                }
+
+                if (request.Priority != ReminderPriority.ScheduleCritical &&
+                    _lastShownAt is { } lastShown &&
+                    now - lastShown < MinimumReminderGap)
+                {
+                    Requeue(request);
+                    await DelayQueueAsync(MinimumReminderGap - (now - lastShown));
+                    continue;
+                }
+
+                await PresentAsync(request, _disposeTokenSource.Token);
+            }
+        }
+        catch (OperationCanceledException) when (_disposeTokenSource.IsCancellationRequested)
+        {
+            // 正常退出。
+        }
+        catch (Exception exception)
+        {
+            FileLogger.Write(exception);
+        }
+        finally
+        {
+            Volatile.Write(ref _processing, 0);
+            lock (_syncRoot)
+            {
+                if (!_disposed && _queue.Count > 0)
+                {
+                    StartProcessor();
+                }
+            }
+        }
+    }
+
+    private async Task PresentAsync(ReminderPresentationRequest request, CancellationToken cancellationToken)
+    {
+        _currentPriority = request.Priority;
+        _lastShownAt = DateTimeOffset.Now;
+        var reminderIcon = request.Kind switch
+        {
+            ReminderPresentationKind.Drink => ReminderIconType.Drink,
+            ReminderPresentationKind.Stand => ReminderIconType.Stand,
+            ReminderPresentationKind.Cleaning => ReminderIconType.Cleaning,
+            _ => (ReminderIconType?)null
+        };
+        if (reminderIcon is { } icon)
+        {
+            ReminderStarted?.Invoke(icon);
+        }
+
+        try
+        {
+            if (request.MarkShownAsync is not null)
+            {
+                await request.MarkShownAsync(_lastShownAt.Value, cancellationToken);
+            }
+
+            Task speechTask = Task.CompletedTask;
+            if (request.PlaySpeech && ShouldPlaySpeech(request.Kind))
+            {
+                var speechText = _speechTemplateProvider.Resolve(request);
+                if (!string.IsNullOrWhiteSpace(speechText))
+                {
+                    speechTask = _speechService.SpeakAsync(speechText, cancellationToken);
+                }
+            }
+
+            var action = ReminderAction.Dismissed;
+            if (request.ShowPopup)
+            {
+                var completion = new TaskCompletionSource<ReminderAction>(
+                    TaskCreationOptions.RunContinuationsAsynchronously);
+                var popup = new ReminderPopupWindow(request, _iconService);
+                _currentPopup = popup;
+                popup.ActionSelected += (_, selectedAction) => completion.TrySetResult(selectedAction);
+                popup.Show();
+                action = await completion.Task.WaitAsync(cancellationToken);
+                _currentPopup = null;
+            }
+
+            try
+            {
+                await speechTask;
+            }
+            catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
+            {
+                throw;
+            }
+            catch (Exception exception)
+            {
+                FileLogger.Write(exception);
+            }
+
+            if (request.HandleActionAsync is not null)
+            {
+                await request.HandleActionAsync(action, cancellationToken);
+            }
+        }
+        finally
+        {
+            if (reminderIcon is not null)
+            {
+                ReminderEnded?.Invoke();
+            }
+
+            _currentPriority = null;
+        }
+    }
+
+    private ReminderPresentationRequest? TakeNextRequest()
+    {
+        lock (_syncRoot)
+        {
+            _queue.RemoveAll(item => item.Request.ExpiresAt <= DateTimeOffset.Now);
+            var next = _queue
+                .OrderByDescending(static item => item.Request.Priority)
+                .ThenBy(static item => item.Sequence)
+                .FirstOrDefault();
+            if (next is null)
+            {
+                return null;
+            }
+
+            _queue.Remove(next);
+            return next.Request;
+        }
+    }
+
+    private bool ShouldPlaySpeech(ReminderPresentationKind kind)
+    {
+        return kind switch
+        {
+            ReminderPresentationKind.Cleaning => _settings.CleaningSpeechEnabled,
+            ReminderPresentationKind.LunchSoon or
+                ReminderPresentationKind.LunchStart or
+                ReminderPresentationKind.AfternoonStart or
+                ReminderPresentationKind.OffWork => _settings.ScheduleSpeechEnabled,
+            _ => true
+        };
+    }
+
+    private void Requeue(ReminderPresentationRequest request)
+    {
+        lock (_syncRoot)
+        {
+            _queue.Add(new QueuedReminder(request, Interlocked.Increment(ref _sequence)));
+        }
+    }
+
+    private async Task DelayQueueAsync(TimeSpan delay)
+    {
+        if (delay < TimeSpan.FromMilliseconds(100))
+        {
+            return;
+        }
+
+        using var delayTokenSource = CancellationTokenSource.CreateLinkedTokenSource(
+            _disposeTokenSource.Token);
+        lock (_syncRoot)
+        {
+            _queueDelayTokenSource?.Dispose();
+            _queueDelayTokenSource = delayTokenSource;
+        }
+
+        try
+        {
+            await Task.Delay(delay, delayTokenSource.Token);
+        }
+        catch (OperationCanceledException) when (!_disposeTokenSource.IsCancellationRequested)
+        {
+            // 更高优先级提醒到达，立即重新选择队列。
+        }
+        finally
+        {
+            lock (_syncRoot)
+            {
+                if (ReferenceEquals(_queueDelayTokenSource, delayTokenSource))
+                {
+                    _queueDelayTokenSource = null;
+                }
+            }
+        }
+    }
+
+    private sealed record QueuedReminder(ReminderPresentationRequest Request, long Sequence);
+}

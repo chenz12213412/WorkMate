@@ -1,0 +1,23 @@
+bin/
+obj/
+artifacts/
+.tools/
+.vs/
+*.user
+*.suo
+
+# WorkMate local runtime data
+*.db
+*.db-wal
+*.db-shm
+*.sqlite
+*.sqlite3
+*.log
+
+# Local secrets and signing material
+.env
+.env.*
+!.env.example
+*.pfx
+*.p12
+*.key
