@@ -114,6 +114,9 @@ V0.2.1 P1 stabilization completed；S1～S5 数据正确性、并发状态转换
 - V0.2.1 Final Review Fix：StandReminderCycle 增加 Expire 终态；队列删除过期 Reminder 前先执行 `HandleActionAsync(Expired)`，普通 Stand 与 Snooze Expired 都会解除 Pending。
 - V0.2.1 Final Review Fix：ReminderPresentationService 增加当前 Presentation 的 Preempted 生命周期标记；即使没有 Popup、只有 Speech，Schedule Critical 抢占也会记录 Preempted，并在有效期内重新排队。
 - V0.2.1 Final Review Fix：ReminderAction 与 ReminderHistoryStatus 的终态映射补齐 Expired；Completed、Snoozed、Dismissed、Preempted、Expired 不再混用。
+- V0.2.1 Final Review Fix 2：有效期内的 Preempted 只作为内部 Presentation Outcome，直接 Requeue，不再调用 Reminder HandleActionAsync，不写入数据库 Preempted；因此重新展示后仍可正常 Snooze 并保存 next_due_at。
+- V0.2.1 Final Review Fix 2：ReminderEngine 启动时将旧版本遗留的普通 Preempted 记录恢复为 Triggered，避免升级后无法再次展示。
+- V0.2.1 Final Review Fix 2：AutoOvertimeSuggestionService 明确映射 StartOvertime=Completed、Skipped=Skipped、Dismissed=Dismissed、Expired=Expired、Preempted=Preempted。
 
 ## Known Issues
 
@@ -129,4 +132,4 @@ V0.2.1 P1 stabilization completed；S1～S5 数据正确性、并发状态转换
 
 ## Next Step
 
-V0.2.1 P2 H1～H8 与 Final Review Blocker 修复已在本地完成，等待最后 Review，不合并 main。
+V0.2.1 P2 H1～H8 与两轮 Final Review 修复已在本地完成，等待最后 Review，不合并 main。

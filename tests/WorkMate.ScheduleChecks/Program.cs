@@ -980,6 +980,54 @@ try
     AssertEqual(restoredSnoozes.Count, 1, "Ordinary snoozes must be restored after restarting the database store.");
     AssertEqual(restoredSnoozes[0].NextDueAt is not null, true, "Restored ordinary snooze must retain next_due_at.");
 
+    var preemptedOrdinaryType = "Stand:preempted-requeue";
+    await database.TryClaimReminderAsync(preemptedOrdinaryType, historyDate, shownAt, "站立", CancellationToken.None);
+    var preemptedOutcome = new ReminderPresentationLifecycle();
+    preemptedOutcome.MarkPreempted();
+    AssertEqual(
+        preemptedOutcome.Resolve(
+            ReminderAction.Dismissed,
+            DateTimeOffset.Now.AddMinutes(1),
+            DateTimeOffset.Now),
+        ReminderAction.Preempted,
+        "A valid preemption should be requeued as an internal outcome.");
+    var beforeSnooze = await database.GetReminderHistoryAsync(preemptedOrdinaryType, historyDate, CancellationToken.None);
+    AssertEqual(beforeSnooze?.Status, ReminderHistoryStatus.Triggered, "A requeued preemption must keep Triggered persistence.");
+    var requeueDueAt = DateTimeOffset.Now.AddMinutes(10);
+    AssertEqual(
+        await database.TrySnoozeReminderAsync(preemptedOrdinaryType, historyDate, requeueDueAt, 1, CancellationToken.None),
+        true,
+        "A requeued reminder must still accept Snooze.");
+    var requeueSnooze = await database.GetReminderHistoryAsync(preemptedOrdinaryType, historyDate, CancellationToken.None);
+    AssertEqual(requeueSnooze?.Status, ReminderHistoryStatus.Snoozed, "Requeued reminder should persist Snoozed status.");
+    AssertEqual(requeueSnooze?.NextDueAt is not null, true, "Requeued Snooze must persist next_due_at.");
+
+    var legacyPreemptedType = "Drink:legacy-preempted";
+    await database.TryClaimReminderAsync(legacyPreemptedType, historyDate, shownAt, "喝水", CancellationToken.None);
+    await database.RecordReminderActionAsync(
+        legacyPreemptedType,
+        historyDate,
+        ReminderAction.Preempted.ToString(),
+        ReminderHistoryStatus.Preempted,
+        shownAt,
+        CancellationToken.None);
+    await database.RestorePreemptedOrdinaryRemindersAsync(historyDate, CancellationToken.None);
+    var restoredLegacyPreempted = await database.GetReminderHistoryAsync(legacyPreemptedType, historyDate, CancellationToken.None);
+    AssertEqual(restoredLegacyPreempted?.Status, ReminderHistoryStatus.Triggered, "A legacy persisted Preempted ordinary reminder must recover as Triggered.");
+
+    AssertEqual(
+        AutoOvertimeSuggestionService.MapActionToStatus(ReminderAction.Expired),
+        ReminderHistoryStatus.Expired,
+        "Auto overtime Expired must not be persisted as Dismissed.");
+    AssertEqual(
+        AutoOvertimeSuggestionService.MapActionToStatus(ReminderAction.Dismissed),
+        ReminderHistoryStatus.Dismissed,
+        "Auto overtime Dismissed must remain Dismissed.");
+    AssertEqual(
+        AutoOvertimeSuggestionService.MapActionToStatus(ReminderAction.StartOvertime),
+        ReminderHistoryStatus.Completed,
+        "Auto overtime StartOvertime must be persisted as Completed.");
+
     var preemptedType = "Schedule.Preempted.Test";
     AssertEqual(
         await database.TryClaimReminderAsync(preemptedType, historyDate, shownAt, "测试", CancellationToken.None),

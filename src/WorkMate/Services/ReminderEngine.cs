@@ -89,6 +89,9 @@ public sealed class ReminderEngine : IDisposable
     {
         _cleaningSettings = await _cleaningSettingsStore.LoadAsync(cancellationToken);
         _presentationSettings = await _presentationSettingsStore.LoadAsync(cancellationToken);
+        await _database.RestorePreemptedOrdinaryRemindersAsync(
+            DateOnly.FromDateTime(DateTime.Now),
+            cancellationToken);
         _presentationService.ApplySettings(_presentationSettings);
         _lastActivitySnapshotAt = DateTime.Now;
         _timer.Change(TimeSpan.FromSeconds(1), PollInterval);

@@ -299,14 +299,17 @@ public sealed class ReminderPresentationService : IReminderPresentationService
 
             action = lifecycle.Resolve(action, request.ExpiresAt, DateTimeOffset.Now);
 
+            if (action == ReminderAction.Preempted)
+            {
+                // Preempted 是一次 Presentation Outcome。只要仍在有效期内，
+                // 就直接重排队，不能把它写成 Reminder 的最终状态。
+                Requeue(request);
+                return;
+            }
+
             if (request.HandleActionAsync is not null)
             {
                 await request.HandleActionAsync(action, cancellationToken);
-            }
-
-            if (action == ReminderAction.Preempted && request.ExpiresAt > DateTimeOffset.Now)
-            {
-                Requeue(request);
             }
         }
         finally

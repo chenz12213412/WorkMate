@@ -375,6 +375,27 @@ public sealed class DatabaseStore
         return result;
     }
 
+    public async Task RestorePreemptedOrdinaryRemindersAsync(
+        DateOnly date,
+        CancellationToken cancellationToken)
+    {
+        await EnsureInitializedAsync(cancellationToken);
+        await using var connection = new SqliteConnection(_connectionString);
+        await connection.OpenAsync(cancellationToken);
+        var command = connection.CreateCommand();
+        command.CommandText = """
+            UPDATE reminder_history
+            SET status = 'Triggered',
+                action = NULL,
+                next_due_at = NULL
+            WHERE reminder_date = $date
+              AND status = 'Preempted'
+              AND (reminder_type LIKE 'Drink:%' OR reminder_type LIKE 'Stand:%');
+            """;
+        command.Parameters.AddWithValue("$date", FormatDate(date));
+        await command.ExecuteNonQueryAsync(cancellationToken);
+    }
+
     public async Task RecordReminderShownAsync(
         string reminderType,
         DateOnly date,

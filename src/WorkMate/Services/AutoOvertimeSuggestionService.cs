@@ -92,16 +92,25 @@ public sealed class AutoOvertimeSuggestionService : IDisposable
             return;
         }
 
+        var status = MapActionToStatus(action);
         await _database.RecordReminderActionAsync(
             ReminderType,
             DateOnly.FromDateTime(DateTime.Now),
             action.ToString(),
-            action == ReminderAction.Skipped
-                ? ReminderHistoryStatus.Skipped
-                : ReminderHistoryStatus.Dismissed,
+            status,
             DateTimeOffset.Now,
             cancellationToken);
     }
+
+    public static ReminderHistoryStatus MapActionToStatus(ReminderAction action) => action switch
+    {
+        ReminderAction.StartOvertime => ReminderHistoryStatus.Completed,
+        ReminderAction.Skipped => ReminderHistoryStatus.Skipped,
+        ReminderAction.Dismissed => ReminderHistoryStatus.Dismissed,
+        ReminderAction.Expired => ReminderHistoryStatus.Expired,
+        ReminderAction.Preempted => ReminderHistoryStatus.Preempted,
+        _ => ReminderHistoryStatus.Dismissed
+    };
 
     public void Dispose()
     {
