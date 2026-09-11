@@ -33,6 +33,7 @@ public sealed class ReminderPresentationService : IReminderPresentationService
     private int _processing;
     private bool _systemAvailable = true;
     private int _disposeState;
+    private ReminderPresentationLifecycle? _currentLifecycle;
     private ReminderPresentationSettings _settings = ReminderPresentationSettings.Default;
 
     public ReminderPresentationService(
@@ -88,6 +89,7 @@ public sealed class ReminderPresentationService : IReminderPresentationService
                 _queueDelayTokenSource?.Cancel();
                 if (_currentPriority is { } priority && priority < ReminderPriority.ScheduleCritical)
                 {
+                    _currentLifecycle?.MarkPreempted();
                     _dispatcher.BeginInvoke(() =>
                     {
                         _speechService.Stop();
@@ -113,6 +115,11 @@ public sealed class ReminderPresentationService : IReminderPresentationService
             _systemAvailable = available;
             if (!available)
             {
+                if (_currentPriority is { } priority && priority < ReminderPriority.ScheduleCritical)
+                {
+                    _currentLifecycle?.MarkPreempted();
+                }
+
                 _speechService.Stop();
                 _dispatcher.BeginInvoke(() => _currentPopup?.CloseForPreemption());
             }
@@ -167,6 +174,11 @@ public sealed class ReminderPresentationService : IReminderPresentationService
         {
             while (Volatile.Read(ref _disposeState) == 0)
             {
+                foreach (var expired in TakeExpiredRequests())
+                {
+                    await FinalizeExpiredAsync(expired, _disposeTokenSource.Token);
+                }
+
                 var request = TakeNextRequest();
                 if (request is null)
                 {
@@ -183,6 +195,7 @@ public sealed class ReminderPresentationService : IReminderPresentationService
                 var now = DateTimeOffset.Now;
                 if (request.ExpiresAt <= now)
                 {
+                    await FinalizeExpiredAsync(request, _disposeTokenSource.Token);
                     continue;
                 }
 
@@ -221,6 +234,8 @@ public sealed class ReminderPresentationService : IReminderPresentationService
 
     private async Task PresentAsync(ReminderPresentationRequest request, CancellationToken cancellationToken)
     {
+        var lifecycle = new ReminderPresentationLifecycle();
+        _currentLifecycle = lifecycle;
         _currentPriority = request.Priority;
         _lastShownAt = DateTimeOffset.Now;
         var reminderIcon = request.Kind switch
@@ -259,7 +274,11 @@ public sealed class ReminderPresentationService : IReminderPresentationService
                     TaskCreationOptions.RunContinuationsAsynchronously);
                 var popup = new ReminderPopupWindow(request, _iconService);
                 _currentPopup = popup;
-                popup.ActionSelected += (_, selectedAction) => completion.TrySetResult(selectedAction);
+                popup.ActionSelected += (_, selectedAction) =>
+                {
+                    lifecycle.MarkActionSelected(selectedAction);
+                    completion.TrySetResult(selectedAction);
+                };
                 popup.Show();
                 action = await completion.Task.WaitAsync(cancellationToken);
                 _currentPopup = null;
@@ -278,6 +297,8 @@ public sealed class ReminderPresentationService : IReminderPresentationService
                 FileLogger.Write(exception);
             }
 
+            action = lifecycle.Resolve(action, request.ExpiresAt, DateTimeOffset.Now);
+
             if (request.HandleActionAsync is not null)
             {
                 await request.HandleActionAsync(action, cancellationToken);
@@ -295,7 +316,36 @@ public sealed class ReminderPresentationService : IReminderPresentationService
                 ReminderEnded?.Invoke();
             }
 
+            _currentLifecycle = null;
             _currentPriority = null;
+        }
+    }
+
+    private IReadOnlyList<ReminderPresentationRequest> TakeExpiredRequests()
+    {
+        lock (_syncRoot)
+        {
+            var now = DateTimeOffset.Now;
+            var expired = _queue
+                .Where(item => item.Request.ExpiresAt <= now)
+                .Select(static item => item.Request)
+                .ToArray();
+            if (expired.Length > 0)
+            {
+                _queue.RemoveAll(item => item.Request.ExpiresAt <= now);
+            }
+
+            return expired;
+        }
+    }
+
+    private static async Task FinalizeExpiredAsync(
+        ReminderPresentationRequest request,
+        CancellationToken cancellationToken)
+    {
+        if (request.HandleActionAsync is not null)
+        {
+            await request.HandleActionAsync(ReminderAction.Expired, cancellationToken);
         }
     }
 
@@ -303,7 +353,6 @@ public sealed class ReminderPresentationService : IReminderPresentationService
     {
         lock (_syncRoot)
         {
-            _queue.RemoveAll(item => item.Request.ExpiresAt <= DateTimeOffset.Now);
             var next = _queue
                 .OrderByDescending(static item => item.Request.Priority)
                 .ThenBy(static item => item.Sequence)
@@ -380,4 +429,36 @@ public sealed class ReminderPresentationService : IReminderPresentationService
     }
 
     private sealed record QueuedReminder(ReminderPresentationRequest Request, long Sequence);
+}
+
+public sealed class ReminderPresentationLifecycle
+{
+    private int _preempted;
+    private int _userActionSelected;
+
+    public void MarkPreempted() => Interlocked.Exchange(ref _preempted, 1);
+
+    public void MarkActionSelected(ReminderAction action)
+    {
+        if (action != ReminderAction.Preempted)
+        {
+            Interlocked.Exchange(ref _userActionSelected, 1);
+        }
+    }
+
+    public ReminderAction Resolve(
+        ReminderAction action,
+        DateTimeOffset expiresAt,
+        DateTimeOffset now)
+    {
+        if (Volatile.Read(ref _preempted) != 0 &&
+            Volatile.Read(ref _userActionSelected) == 0)
+        {
+            action = ReminderAction.Preempted;
+        }
+
+        return action == ReminderAction.Preempted && expiresAt <= now
+            ? ReminderAction.Expired
+            : action;
+    }
 }

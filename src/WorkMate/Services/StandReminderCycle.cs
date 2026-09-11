@@ -26,6 +26,8 @@ public sealed class StandReminderCycle
 
     public void Complete() => Reset();
 
+    public void Expire() => Reset();
+
     public void Reset()
     {
         _activeSeconds = 0;

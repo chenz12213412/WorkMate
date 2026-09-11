@@ -412,6 +412,9 @@ public sealed class ReminderEngine : IDisposable
         var histories = await _database.GetSnoozedOrdinaryRemindersAsync(date, cancellationToken);
         foreach (var history in histories)
         {
+            var kind = history.ReminderType.StartsWith("Drink:", StringComparison.OrdinalIgnoreCase)
+                ? ReminderKind.DrinkWater
+                : ReminderKind.Stand;
             if (history.NextDueAt is not { } dueAt || dueAt > now)
             {
                 continue;
@@ -425,12 +428,13 @@ public sealed class ReminderEngine : IDisposable
                     ReminderHistoryStatus.Expired,
                     now,
                     cancellationToken);
+                if (kind == ReminderKind.Stand)
+                {
+                    _standReminderCycle.Expire();
+                }
                 continue;
             }
 
-            var kind = history.ReminderType.StartsWith("Drink:", StringComparison.OrdinalIgnoreCase)
-                ? ReminderKind.DrinkWater
-                : ReminderKind.Stand;
             if (!CanDeliver(kind, now.LocalDateTime) ||
                 !await _database.TryConsumeSnoozedReminderAsync(
                     history.ReminderType,
@@ -758,6 +762,10 @@ public sealed class ReminderEngine : IDisposable
                         _ = RequeueOrdinaryAfterSnoozeAsync(request, date);
                     }
                 }
+                else if (action == ReminderAction.Expired && !isDrink)
+                {
+                    _standReminderCycle.Expire();
+                }
 
                 await RecordActionAsync(historyType, date, action, token);
             },
@@ -840,6 +848,7 @@ public sealed class ReminderEngine : IDisposable
             ReminderAction.Snoozed => ReminderHistoryStatus.Snoozed,
             ReminderAction.Skipped => ReminderHistoryStatus.Skipped,
             ReminderAction.Preempted => ReminderHistoryStatus.Preempted,
+            ReminderAction.Expired => ReminderHistoryStatus.Expired,
             _ => ReminderHistoryStatus.Dismissed
         };
         return _database.RecordReminderActionAsync(

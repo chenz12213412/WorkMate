@@ -455,6 +455,11 @@ AssertEqual(
     standCycle.Advance(TimeSpan.FromMinutes(50), true, TimeSpan.FromMinutes(50)),
     true,
     "Completing a stand reminder must start a new full reminder cycle.");
+standCycle.Expire();
+AssertEqual(
+    standCycle.Advance(TimeSpan.FromMinutes(50), true, TimeSpan.FromMinutes(50)),
+    true,
+    "An expired queued stand reminder must release pending state for a new cycle.");
 standCycle.Reset();
 standCycle.Advance(TimeSpan.FromMinutes(40), true, TimeSpan.FromMinutes(50));
 standCycle.Reset();
@@ -462,6 +467,44 @@ AssertEqual(
     standCycle.Advance(TimeSpan.FromMinutes(10), true, TimeSpan.FromMinutes(50)),
     false,
     "AFK, lunch, off-work, sleep, and lock resets must discard the previous stand interval.");
+var speechOnlyLifecycle = new ReminderPresentationLifecycle();
+speechOnlyLifecycle.MarkPreempted();
+AssertEqual(
+    speechOnlyLifecycle.Resolve(
+        ReminderAction.Dismissed,
+        DateTimeOffset.Now.AddMinutes(1),
+        DateTimeOffset.Now),
+    ReminderAction.Preempted,
+    "Speech-only preemption must not fall back to Dismissed.");
+var popupLifecycle = new ReminderPresentationLifecycle();
+popupLifecycle.MarkPreempted();
+popupLifecycle.MarkActionSelected(ReminderAction.Preempted);
+AssertEqual(
+    popupLifecycle.Resolve(
+        ReminderAction.Preempted,
+        DateTimeOffset.Now.AddMinutes(1),
+        DateTimeOffset.Now),
+    ReminderAction.Preempted,
+    "Popup preemption must remain Preempted and eligible for requeue.");
+var expiredLifecycle = new ReminderPresentationLifecycle();
+expiredLifecycle.MarkPreempted();
+AssertEqual(
+    expiredLifecycle.Resolve(
+        ReminderAction.Dismissed,
+        DateTimeOffset.Now.AddMinutes(-1),
+        DateTimeOffset.Now),
+    ReminderAction.Expired,
+    "Preempted reminders past ExpiresAt must finalize as Expired.");
+var completedLifecycle = new ReminderPresentationLifecycle();
+completedLifecycle.MarkActionSelected(ReminderAction.Completed);
+completedLifecycle.MarkPreempted();
+AssertEqual(
+    completedLifecycle.Resolve(
+        ReminderAction.Completed,
+        DateTimeOffset.Now.AddMinutes(1),
+        DateTimeOffset.Now),
+    ReminderAction.Completed,
+    "A completed user action must not be overwritten by a later preemption.");
 
 var intensityCalculator = new WorkIntensityCalculator();
 var quietIntensity = intensityCalculator.Calculate(new ActivityIntensityInput(
@@ -951,6 +994,10 @@ try
         CancellationToken.None);
     var preemptedHistory = await database.GetReminderHistoryAsync(preemptedType, historyDate, CancellationToken.None);
     AssertEqual(preemptedHistory?.Status, ReminderHistoryStatus.Preempted, "Preempted reminders must not be recorded as dismissed.");
+    AssertEqual(
+        Enum.Parse<ReminderHistoryStatus>(ReminderAction.Expired.ToString()),
+        ReminderHistoryStatus.Expired,
+        "Expired must remain a distinct reminder final outcome.");
 
     var expiredDate = DateOnly.FromDateTime(DateTime.Now);
     var expiredType = "Stand:expired-test";

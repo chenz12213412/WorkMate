@@ -111,12 +111,15 @@ V0.2.1 P1 stabilization completed；S1～S5 数据正确性、并发状态转换
 - V0.2.1 P2 H6：DatabaseStore 使用 PRAGMA user_version=3 的顺序迁移；旧 V0.2 数据保留，新增列在事务内补齐。
 - V0.2.1 P2 H7：ScheduleChecks 扩展 Snooze 重启恢复、Preempted、WorkModeSnapshot、Schema Version 和双重 Dispose 回归检查。
 - V0.2.1 P2 H8：新增 `.github/workflows/build.yml`，默认执行 Windows Release Build、ScheduleChecks；UI Capture 不纳入无头 CI。
+- V0.2.1 Final Review Fix：StandReminderCycle 增加 Expire 终态；队列删除过期 Reminder 前先执行 `HandleActionAsync(Expired)`，普通 Stand 与 Snooze Expired 都会解除 Pending。
+- V0.2.1 Final Review Fix：ReminderPresentationService 增加当前 Presentation 的 Preempted 生命周期标记；即使没有 Popup、只有 Speech，Schedule Critical 抢占也会记录 Preempted，并在有效期内重新排队。
+- V0.2.1 Final Review Fix：ReminderAction 与 ReminderHistoryStatus 的终态映射补齐 Expired；Completed、Snoozed、Dismissed、Preempted、Expired 不再混用。
 
 ## Known Issues
 
 - Self-contained 单文件运行时的 Working Set 可能高于 100 MB；Private Memory 仍以低于 100 MB 为优先目标。
 - 已完成 30.5 分钟实机资源测试和 2 小时等效聚合测试；完整 2 小时实时时钟 Soak 仍建议在发布候选机继续执行。
-- GitHub Actions 需要在仓库启用后由远端 Windows Runner 执行；本地已使用相同 Release Build 与 ScheduleChecks 命令验证。
+- GitHub Actions 需要在仓库启用后由远端 Windows Runner 执行；本地已使用相同 Debug/Release Build 与 ScheduleChecks 命令验证。
 
 ## UI Decisions
 
@@ -126,4 +129,4 @@ V0.2.1 P1 stabilization completed；S1～S5 数据正确性、并发状态转换
 
 ## Next Step
 
-V0.2.1 P2 H1～H8 已在本地完成，下一步是提交分支并在 GitHub Actions 上确认 Windows Runner 结果。
+V0.2.1 P2 H1～H8 与 Final Review Blocker 修复已在本地完成，等待最后 Review，不合并 main。

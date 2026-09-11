@@ -28,7 +28,8 @@ public enum ReminderAction
     Snoozed,
     Skipped,
     StartOvertime,
-    Preempted
+    Preempted,
+    Expired
 }
 
 public sealed record ReminderActionOption(
