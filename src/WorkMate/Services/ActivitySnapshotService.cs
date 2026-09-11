@@ -14,7 +14,7 @@ public interface IActivitySnapshotService : IActivitySeriesProvider, IDisposable
 
     Task FlushAsync(CancellationToken cancellationToken);
 
-    void SetSystemAvailable(bool available);
+    Task SetSystemAvailableAsync(bool available, CancellationToken cancellationToken = default);
 }
 
 public sealed class ActivitySnapshotService : IActivitySnapshotService
@@ -46,6 +46,7 @@ public sealed class ActivitySnapshotService : IActivitySnapshotService
     private volatile bool _systemAvailable = true;
     private int _ticksSinceFlush;
     private bool _disposed;
+    private int _disposeStarted;
 
     public ActivitySnapshotService(
         DatabaseStore database,
@@ -77,7 +78,14 @@ public sealed class ActivitySnapshotService : IActivitySnapshotService
         _mouseAvailable = TryStart(_mouseCollector.Start);
         _foregroundAvailable = TryStart(_foregroundCollector.Start);
         _lastSampleAt = DateTime.Now;
-        PublishSnapshot(_lastSampleAt, null, null, UserActivityState.Afk, 0);
+        var initialSnapshot = PublishSnapshot(
+            _lastSampleAt,
+            null,
+            null,
+            UserActivityState.Afk,
+            0,
+            false);
+        SnapshotUpdated?.Invoke(this, initialSnapshot);
         _timer.Change(SampleInterval, SampleInterval);
     }
 
@@ -87,28 +95,68 @@ public sealed class ActivitySnapshotService : IActivitySnapshotService
         return Current;
     }
 
-    public void SetSystemAvailable(bool available)
+    public async Task SetSystemAvailableAsync(
+        bool available,
+        CancellationToken cancellationToken = default)
     {
-        if (_disposed || _systemAvailable == available)
+        if (Volatile.Read(ref _disposeStarted) != 0)
         {
             return;
         }
 
-        _systemAvailable = available;
         if (!available)
         {
             _timer.Change(Timeout.InfiniteTimeSpan, Timeout.InfiniteTimeSpan);
-            DrainPendingCollectorData();
-            _workSession.Reset();
-            _intensityCalculator.Reset();
-            PublishSnapshot(DateTime.Now, null, null, UserActivityState.Afk, 0);
-            _ = FlushSafelyAsync();
         }
-        else
+
+        if (!available && _systemAvailable)
         {
-            DrainPendingCollectorData();
-            _lastSampleAt = DateTime.Now;
-            _intensityCalculator.Reset();
+            await ProcessTickAsync(DateTime.Now, cancellationToken, waitForGate: true);
+        }
+
+        ActivityDashboardSnapshot? notification = null;
+        await _tickLock.WaitAsync(cancellationToken);
+        try
+        {
+            if (_disposed || _systemAvailable == available)
+            {
+                return;
+            }
+
+            if (!available)
+            {
+                DrainPendingCollectorData();
+                _workSession.Reset();
+                _intensityCalculator.Reset();
+                _systemAvailable = false;
+                notification = PublishSnapshot(
+                    DateTime.Now,
+                    null,
+                    null,
+                    UserActivityState.Afk,
+                    0,
+                    false);
+                await PersistDirtyAsync(cancellationToken);
+            }
+            else
+            {
+                DrainPendingCollectorData();
+                _lastSampleAt = DateTime.Now;
+                _intensityCalculator.Reset();
+                _systemAvailable = true;
+            }
+        }
+        finally
+        {
+            _tickLock.Release();
+            if (notification is not null)
+            {
+                SnapshotUpdated?.Invoke(this, notification);
+            }
+        }
+
+        if (available && !_disposed && _systemAvailable)
+        {
             _timer.Change(SampleInterval, SampleInterval);
         }
     }
@@ -117,7 +165,7 @@ public sealed class ActivitySnapshotService : IActivitySnapshotService
     {
         if (_systemAvailable && !_disposed)
         {
-            await ProcessTickAsync(DateTime.Now, cancellationToken);
+            await ProcessTickAsync(DateTime.Now, cancellationToken, waitForGate: true);
         }
 
         await _tickLock.WaitAsync(cancellationToken);
@@ -133,7 +181,7 @@ public sealed class ActivitySnapshotService : IActivitySnapshotService
 
     public void Dispose()
     {
-        if (_disposed)
+        if (Interlocked.Exchange(ref _disposeStarted, 1) != 0)
         {
             return;
         }
@@ -170,15 +218,32 @@ public sealed class ActivitySnapshotService : IActivitySnapshotService
         }
     }
 
-    private async Task ProcessTickAsync(DateTime now, CancellationToken cancellationToken)
+    private async Task ProcessTickAsync(
+        DateTime now,
+        CancellationToken cancellationToken,
+        bool waitForGate = false)
     {
-        if (_disposed || !_systemAvailable || !await _tickLock.WaitAsync(0, cancellationToken))
+        if (_disposed || !_systemAvailable)
         {
             return;
         }
 
+        var entered = waitForGate
+            ? await WaitForGateAsync(cancellationToken)
+            : await _tickLock.WaitAsync(0, cancellationToken);
+        if (!entered)
+        {
+            return;
+        }
+
+        ActivityDashboardSnapshot? notification = null;
         try
         {
+            if (_disposed || !_systemAvailable)
+            {
+                return;
+            }
+
             var start = _lastSampleAt;
             _lastSampleAt = now;
             var elapsed = now - start;
@@ -194,7 +259,13 @@ public sealed class ActivitySnapshotService : IActivitySnapshotService
             {
                 _workSession.Reset();
                 _intensityCalculator.Reset();
-                PublishSnapshot(now, null, _foregroundCollector.GetCurrent(), UserActivityState.Afk, 0);
+                notification = PublishSnapshot(
+                    now,
+                    null,
+                    _foregroundCollector.GetCurrent(),
+                    UserActivityState.Afk,
+                    0,
+                    false);
                 return;
             }
 
@@ -217,10 +288,11 @@ public sealed class ActivitySnapshotService : IActivitySnapshotService
             }
 
             var scheduleState = _scheduleEngine.GetSnapshot(start + TimeSpan.FromTicks(elapsed.Ticks / 2)).State;
+            var workMode = _workModeService.Snapshot;
             var context = new WorkClassificationContext(
                 scheduleState,
-                _workModeService.ActivityMode,
-                _workModeService.IsOvertime,
+                workMode.ActivityMode,
+                workMode.IsOvertime,
                 idle.State,
                 _systemAvailable);
             var category = WorkSliceClassifier.Classify(context);
@@ -242,9 +314,11 @@ public sealed class ActivitySnapshotService : IActivitySnapshotService
                 input,
                 idle.State,
                 switches,
-                foreground?.ProcessName,
-                _workModeService.ResolveScheduleState(scheduleState),
-                _workModeService.ActivityMode,
+                ApplicationProcessPolicy.ShouldPersistApplication(foreground?.ProcessName)
+                    ? foreground!.ProcessName
+                    : null,
+                workMode.IsOvertime ? WorkScheduleState.Overtime : scheduleState,
+                workMode.ActivityMode,
                 category,
                 intensity.ActivityScore,
                 intensity.WorkIntensity,
@@ -262,7 +336,13 @@ public sealed class ActivitySnapshotService : IActivitySnapshotService
                     usage.ProcessName,
                     idle.State == UserActivityState.Active);
             }
-            PublishSnapshot(now, intensity, foreground, idle.State, idle.IdleDuration.TotalSeconds);
+            notification = PublishSnapshot(
+                now,
+                intensity,
+                foreground,
+                idle.State,
+                idle.IdleDuration.TotalSeconds,
+                category != WorkTimeCategory.None);
 
             _ticksSinceFlush++;
             if (_ticksSinceFlush >= SamplesPerPersistenceFlush)
@@ -273,7 +353,17 @@ public sealed class ActivitySnapshotService : IActivitySnapshotService
         finally
         {
             _tickLock.Release();
+            if (notification is not null)
+            {
+                SnapshotUpdated?.Invoke(this, notification);
+            }
         }
+    }
+
+    private async Task<bool> WaitForGateAsync(CancellationToken cancellationToken)
+    {
+        await _tickLock.WaitAsync(cancellationToken);
+        return true;
     }
 
     private void AddAppUsageAcrossDates(DateTime start, DateTime end, string? processName, bool isActive)
@@ -311,12 +401,13 @@ public sealed class ActivitySnapshotService : IActivitySnapshotService
         _ticksSinceFlush = 0;
     }
 
-    private void PublishSnapshot(
+    private ActivityDashboardSnapshot PublishSnapshot(
         DateTime now,
         ActivityIntensityResult? intensity,
         ForegroundAppSnapshot? foreground,
         UserActivityState userState,
-        double idleSeconds)
+        double idleSeconds,
+        bool workIntensityAvailable)
     {
         var buckets = _aggregator.GetBuckets(DateOnly.FromDateTime(now));
         var session = _workSession.GetSnapshot();
@@ -324,11 +415,15 @@ public sealed class ActivitySnapshotService : IActivitySnapshotService
             bucket.NormalWorkSeconds + bucket.OvertimeSeconds + bucket.ManualWorkSeconds);
         var snapshot = new ActivityDashboardSnapshot(
             intensity?.ActivityScore ?? (buckets.Count == 0 ? null : (int?)Math.Round(buckets[^1].ActivityScore)),
-            intensity?.WorkIntensity ?? (buckets.Count == 0 ? null : (int?)Math.Round(buckets[^1].WorkIntensity)),
+            workIntensityAvailable ? intensity?.WorkIntensity : null,
             _keyboardAvailable ? buckets.Sum(static bucket => bucket.KeyboardCount) : null,
             _mouseAvailable ? buckets.Sum(static bucket => bucket.MouseClickCount) : null,
             _foregroundAvailable ? buckets.Sum(static bucket => bucket.AppSwitchCount) : null,
-            buckets.Select(static bucket => new ActivitySeriesPoint(bucket.BucketStart, bucket.WorkIntensity)).ToArray(),
+            buckets
+                .Where(static bucket =>
+                    bucket.NormalWorkSeconds + bucket.OvertimeSeconds + bucket.ManualWorkSeconds > 0)
+                .Select(static bucket => new ActivitySeriesPoint(bucket.BucketStart, bucket.WorkIntensity))
+                .ToArray(),
             TimeSpan.FromSeconds(totalWorkSeconds),
             session.ContinuousDuration,
             buckets.Sum(static bucket => bucket.MouseDistance),
@@ -336,7 +431,7 @@ public sealed class ActivitySnapshotService : IActivitySnapshotService
             idleSeconds,
             userState);
         Volatile.Write(ref _current, snapshot);
-        SnapshotUpdated?.Invoke(this, snapshot);
+        return snapshot;
     }
 
     private static bool TryStart(Action start)
@@ -370,18 +465,6 @@ public sealed class ActivitySnapshotService : IActivitySnapshotService
         {
             _foregroundCollector.DrainSwitchCount();
             _foregroundCollector.DrainUsage(DateTimeOffset.Now);
-        }
-    }
-
-    private async Task FlushSafelyAsync()
-    {
-        try
-        {
-            await FlushAsync(CancellationToken.None);
-        }
-        catch (Exception exception)
-        {
-            FileLogger.Write(exception);
         }
     }
 

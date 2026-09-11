@@ -3,6 +3,7 @@ using System.Diagnostics;
 using System.Runtime.InteropServices;
 using System.Text;
 using WorkMate.Models;
+using WorkMate.Services;
 
 namespace WorkMate.Collectors;
 
@@ -10,10 +11,9 @@ public sealed class ForegroundWindowCollector : IDisposable
 {
     private const uint EventSystemForeground = 0x0003;
     private const uint WineventOutOfContext = 0x0000;
-    private const uint WineventSkipOwnProcess = 0x0002;
-
     private readonly object _syncRoot = new();
     private readonly WinEventProc _eventCallback;
+    private readonly ExternalAppSwitchTracker _switchTracker = new();
     private IntPtr _eventHook;
     private ForegroundAppSnapshot? _current;
     private readonly List<ForegroundUsageDelta> _pendingUsage = [];
@@ -42,7 +42,7 @@ public sealed class ForegroundWindowCollector : IDisposable
             _eventCallback,
             0,
             0,
-            WineventOutOfContext | WineventSkipOwnProcess);
+            WineventOutOfContext);
         if (_eventHook == IntPtr.Zero)
         {
             throw new Win32Exception(Marshal.GetLastWin32Error(), "前台程序事件 Hook 初始化失败。");
@@ -146,7 +146,7 @@ public sealed class ForegroundWindowCollector : IDisposable
         lock (_syncRoot)
         {
             AccumulateCurrentUsage(timestamp);
-            if (countSwitch && _current is not null && _current.ProcessId != next.ProcessId)
+            if (_switchTracker.Observe(next.ProcessName, countSwitch))
             {
                 Interlocked.Increment(ref _switchCount);
             }

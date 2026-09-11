@@ -3,12 +3,38 @@ using WorkMate.Infrastructure;
 
 namespace WorkMate.Services;
 
+public sealed class SystemAvailabilityState
+{
+    private readonly object _syncRoot = new();
+    private bool _sessionLocked;
+    private bool _suspended;
+
+    public bool SetSessionLocked(bool locked)
+    {
+        lock (_syncRoot)
+        {
+            _sessionLocked = locked;
+            return !_sessionLocked && !_suspended;
+        }
+    }
+
+    public bool SetSuspended(bool suspended)
+    {
+        lock (_syncRoot)
+        {
+            _suspended = suspended;
+            return !_sessionLocked && !_suspended;
+        }
+    }
+}
+
 public sealed class SystemActivityStateMonitor : IDisposable
 {
     private readonly IActivitySnapshotService _activitySnapshotService;
     private readonly Action<bool>? _availabilityChanged;
-    private bool _sessionLocked;
-    private bool _suspended;
+    private readonly SystemAvailabilityState _state = new();
+    private readonly object _transitionSync = new();
+    private Task _pendingTransition = Task.CompletedTask;
     private bool _disposed;
 
     public SystemActivityStateMonitor(
@@ -31,6 +57,20 @@ public sealed class SystemActivityStateMonitor : IDisposable
         _disposed = true;
         SystemEvents.SessionSwitch -= SystemEvents_OnSessionSwitch;
         SystemEvents.PowerModeChanged -= SystemEvents_OnPowerModeChanged;
+        Task pending;
+        lock (_transitionSync)
+        {
+            pending = _pendingTransition;
+        }
+
+        try
+        {
+            pending.GetAwaiter().GetResult();
+        }
+        catch (Exception exception)
+        {
+            FileLogger.Write(exception);
+        }
     }
 
     private void SystemEvents_OnSessionSwitch(object sender, SessionSwitchEventArgs e)
@@ -39,14 +79,12 @@ public sealed class SystemActivityStateMonitor : IDisposable
         {
             if (e.Reason == SessionSwitchReason.SessionLock)
             {
-                _sessionLocked = true;
+                QueueAvailability(_state.SetSessionLocked(true));
             }
             else if (e.Reason == SessionSwitchReason.SessionUnlock)
             {
-                _sessionLocked = false;
+                QueueAvailability(_state.SetSessionLocked(false));
             }
-
-            UpdateAvailability();
         }
         catch (Exception exception)
         {
@@ -60,14 +98,12 @@ public sealed class SystemActivityStateMonitor : IDisposable
         {
             if (e.Mode == PowerModes.Suspend)
             {
-                _suspended = true;
+                QueueAvailability(_state.SetSuspended(true));
             }
             else if (e.Mode == PowerModes.Resume)
             {
-                _suspended = false;
+                QueueAvailability(_state.SetSuspended(false));
             }
-
-            UpdateAvailability();
         }
         catch (Exception exception)
         {
@@ -75,10 +111,30 @@ public sealed class SystemActivityStateMonitor : IDisposable
         }
     }
 
-    private void UpdateAvailability()
+    private void QueueAvailability(bool available)
     {
-        var available = !_sessionLocked && !_suspended;
-        _activitySnapshotService.SetSystemAvailable(available);
-        _availabilityChanged?.Invoke(available);
+        lock (_transitionSync)
+        {
+            _pendingTransition = _pendingTransition
+                .ContinueWith(
+                    _ => ApplyAvailabilityAsync(available),
+                    CancellationToken.None,
+                    TaskContinuationOptions.None,
+                    TaskScheduler.Default)
+                .Unwrap();
+        }
+    }
+
+    private async Task ApplyAvailabilityAsync(bool available)
+    {
+        try
+        {
+            await _activitySnapshotService.SetSystemAvailableAsync(available);
+            _availabilityChanged?.Invoke(available);
+        }
+        catch (Exception exception)
+        {
+            FileLogger.Write(exception);
+        }
     }
 }

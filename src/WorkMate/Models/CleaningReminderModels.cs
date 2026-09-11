@@ -24,7 +24,8 @@ public enum ReminderHistoryStatus
     Completed,
     Skipped,
     Dismissed,
-    Expired
+    Expired,
+    Preempted
 }
 
 public sealed record ReminderHistoryEntry(

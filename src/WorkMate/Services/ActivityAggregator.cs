@@ -16,29 +16,36 @@ public sealed class ActivityAggregator
             return [];
         }
 
+        var segments = BuildSegments(sample.Start, sample.End);
+        var keyboardAllocations = AllocateDiscrete(sample.Input.KeyboardCount, segments);
+        var mouseClickAllocations = AllocateDiscrete(sample.Input.MouseClickCount, segments);
+        var scrollAllocations = AllocateDiscrete(sample.Input.WheelCount, segments);
+        var appSwitchAllocations = AllocateDiscrete(sample.AppSwitchCount, segments);
         var changed = new List<ActivityBucket>();
         lock (_syncRoot)
         {
             var totalSeconds = (sample.End - sample.Start).TotalSeconds;
-            var segmentStart = sample.Start;
-            while (segmentStart < sample.End)
+            for (var index = 0; index < segments.Count; index++)
             {
-                var bucketStart = FloorToBucket(segmentStart);
-                var bucketEnd = bucketStart.Add(BucketDuration);
-                var midnight = segmentStart.Date.AddDays(1);
-                var segmentEnd = new[] { sample.End, bucketEnd, midnight }.Min();
-                var segmentSeconds = (segmentEnd - segmentStart).TotalSeconds;
+                var segment = segments[index];
+                var segmentSeconds = segment.Seconds;
                 var ratio = segmentSeconds / totalSeconds;
 
-                if (!_buckets.TryGetValue(bucketStart, out var bucket))
+                if (!_buckets.TryGetValue(segment.BucketStart, out var bucket))
                 {
-                    bucket = new MutableBucket(bucketStart, bucketEnd);
-                    _buckets.Add(bucketStart, bucket);
+                    bucket = new MutableBucket(segment.BucketStart, segment.BucketStart.Add(BucketDuration));
+                    _buckets.Add(segment.BucketStart, bucket);
                 }
 
-                bucket.Add(sample, segmentSeconds, ratio);
+                bucket.Add(
+                    sample,
+                    segmentSeconds,
+                    ratio,
+                    keyboardAllocations[index],
+                    mouseClickAllocations[index],
+                    scrollAllocations[index],
+                    checked((int)appSwitchAllocations[index]));
                 changed.Add(bucket.ToRecord());
-                segmentStart = segmentEnd;
             }
         }
 
@@ -94,16 +101,68 @@ public sealed class ActivityAggregator
             timestamp.Kind);
     }
 
+    private static IReadOnlyList<Segment> BuildSegments(DateTime start, DateTime end)
+    {
+        var segments = new List<Segment>();
+        var segmentStart = start;
+        while (segmentStart < end)
+        {
+            var bucketStart = FloorToBucket(segmentStart);
+            var bucketEnd = bucketStart.Add(BucketDuration);
+            var midnight = segmentStart.Date.AddDays(1);
+            var segmentEnd = new[] { end, bucketEnd, midnight }.Min();
+            segments.Add(new Segment(bucketStart, (segmentEnd - segmentStart).TotalSeconds));
+            segmentStart = segmentEnd;
+        }
+
+        return segments;
+    }
+
+    private static long[] AllocateDiscrete(long total, IReadOnlyList<Segment> segments)
+    {
+        var allocations = new long[segments.Count];
+        if (total <= 0 || segments.Count == 0)
+        {
+            return allocations;
+        }
+
+        var totalSeconds = segments.Sum(static segment => segment.Seconds);
+        var remainders = new (int Index, double Fraction)[segments.Count];
+        long allocated = 0;
+        for (var index = 0; index < segments.Count; index++)
+        {
+            var raw = total * (segments[index].Seconds / totalSeconds);
+            var floor = (long)Math.Floor(raw);
+            allocations[index] = floor;
+            allocated += floor;
+            remainders[index] = (index, raw - floor);
+        }
+
+        var remaining = total - allocated;
+        foreach (var remainder in remainders
+                     .OrderByDescending(static item => item.Fraction)
+                     .ThenBy(static item => item.Index)
+                     .Take(checked((int)remaining)))
+        {
+            allocations[remainder.Index]++;
+        }
+
+        return allocations;
+    }
+
+    private sealed record Segment(DateTime BucketStart, double Seconds);
+
     private sealed class MutableBucket
     {
         private readonly Dictionary<string, double> _processDurations = new(StringComparer.OrdinalIgnoreCase);
-        private double _keyboardCount;
-        private double _mouseClickCount;
-        private double _scrollCount;
-        private double _appSwitchCount;
-        private double _activityScoreSeconds;
-        private double _intensitySeconds;
-        private double _sampleSeconds;
+        private long _keyboardCount;
+        private long _mouseClickCount;
+        private long _scrollCount;
+        private int _appSwitchCount;
+        private double _activityScoreWeightedSeconds;
+        private double _activitySampleSeconds;
+        private double _workIntensityWeightedSeconds;
+        private double _workIntensitySampleSeconds;
 
         public MutableBucket(DateTime bucketStart, DateTime bucketEnd)
         {
@@ -131,12 +190,13 @@ public sealed class ActivityAggregator
             LabSeconds = bucket.LabSeconds;
             MeetingSeconds = bucket.MeetingSeconds;
             LongestContinuousWorkSeconds = bucket.LongestContinuousWorkSeconds;
-            _sampleSeconds = Math.Max(1, ActiveSeconds + IdleSeconds + AfkSeconds);
-            _activityScoreSeconds = bucket.ActivityScore * _sampleSeconds;
-            _intensitySeconds = bucket.WorkIntensity * _sampleSeconds;
-            if (!string.IsNullOrWhiteSpace(bucket.DominantProcess))
+            _activitySampleSeconds = Math.Max(1, ActiveSeconds + IdleSeconds + AfkSeconds);
+            _activityScoreWeightedSeconds = bucket.ActivityScore * _activitySampleSeconds;
+            _workIntensitySampleSeconds = NormalWorkSeconds + OvertimeSeconds + ManualWorkSeconds;
+            _workIntensityWeightedSeconds = bucket.WorkIntensity * _workIntensitySampleSeconds;
+            if (ApplicationProcessPolicy.ShouldPersistApplication(bucket.DominantProcess))
             {
-                _processDurations[bucket.DominantProcess] = _sampleSeconds;
+                _processDurations[bucket.DominantProcess!] = _activitySampleSeconds;
             }
         }
 
@@ -168,13 +228,20 @@ public sealed class ActivityAggregator
 
         public double LongestContinuousWorkSeconds { get; private set; }
 
-        public void Add(ActivityAggregationSample sample, double seconds, double inputRatio)
+        public void Add(
+            ActivityAggregationSample sample,
+            double seconds,
+            double inputRatio,
+            long keyboardCount,
+            long mouseClickCount,
+            long scrollCount,
+            int appSwitchCount)
         {
-            _keyboardCount += sample.Input.KeyboardCount * inputRatio;
-            _mouseClickCount += sample.Input.MouseClickCount * inputRatio;
-            _scrollCount += sample.Input.WheelCount * inputRatio;
+            _keyboardCount += keyboardCount;
+            _mouseClickCount += mouseClickCount;
+            _scrollCount += scrollCount;
             MouseDistance += sample.Input.MouseMoveDistance * inputRatio;
-            _appSwitchCount += sample.AppSwitchCount * inputRatio;
+            _appSwitchCount += appSwitchCount;
             LongestContinuousWorkSeconds = Math.Max(
                 LongestContinuousWorkSeconds,
                 sample.LongestContinuousWorkSeconds);
@@ -210,17 +277,22 @@ public sealed class ActivityAggregator
                     break;
             }
 
-            if (!string.IsNullOrWhiteSpace(sample.ForegroundProcess))
+            if (ApplicationProcessPolicy.ShouldPersistApplication(sample.ForegroundProcess))
             {
-                _processDurations.TryGetValue(sample.ForegroundProcess, out var processSeconds);
-                _processDurations[sample.ForegroundProcess] = processSeconds + seconds;
+                var processName = sample.ForegroundProcess!;
+                _processDurations.TryGetValue(processName, out var processSeconds);
+                _processDurations[processName] = processSeconds + seconds;
             }
 
             ScheduleState = sample.ScheduleState;
             WorkMode = sample.WorkMode;
-            _activityScoreSeconds += sample.ActivityScore * seconds;
-            _intensitySeconds += sample.WorkIntensity * seconds;
-            _sampleSeconds += seconds;
+            _activityScoreWeightedSeconds += sample.ActivityScore * seconds;
+            _activitySampleSeconds += seconds;
+            if (sample.WorkCategory != WorkTimeCategory.None)
+            {
+                _workIntensityWeightedSeconds += sample.WorkIntensity * seconds;
+                _workIntensitySampleSeconds += seconds;
+            }
         }
 
         public ActivityBucket ToRecord()
@@ -231,14 +303,14 @@ public sealed class ActivityAggregator
             return new ActivityBucket(
                 BucketStart,
                 BucketEnd,
-                (long)Math.Round(_keyboardCount),
-                (long)Math.Round(_mouseClickCount),
+                _keyboardCount,
+                _mouseClickCount,
                 MouseDistance,
-                (long)Math.Round(_scrollCount),
+                _scrollCount,
                 ActiveSeconds,
                 IdleSeconds,
                 AfkSeconds,
-                (int)Math.Round(_appSwitchCount),
+                _appSwitchCount,
                 dominantProcess,
                 ScheduleState,
                 WorkMode,
@@ -247,8 +319,8 @@ public sealed class ActivityAggregator
                 ManualWorkSeconds,
                 LabSeconds,
                 MeetingSeconds,
-                _sampleSeconds <= 0 ? 0 : _activityScoreSeconds / _sampleSeconds,
-                _sampleSeconds <= 0 ? 0 : _intensitySeconds / _sampleSeconds,
+                _activitySampleSeconds <= 0 ? 0 : _activityScoreWeightedSeconds / _activitySampleSeconds,
+                _workIntensitySampleSeconds <= 0 ? 0 : _workIntensityWeightedSeconds / _workIntensitySampleSeconds,
                 LongestContinuousWorkSeconds);
         }
     }

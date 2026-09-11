@@ -161,6 +161,9 @@ AssertEqual(
     workMode.ResolveScheduleState(WorkScheduleState.OffWork),
     WorkScheduleState.Overtime,
     "Manual overtime should override the scheduled state.");
+var workModeSnapshot = workMode.Snapshot;
+AssertEqual(workModeSnapshot.ActivityMode, ActivityMode.Lab, "Work mode snapshot must expose the current activity mode atomically.");
+AssertEqual(workModeSnapshot.IsOvertime, true, "Work mode snapshot must expose overtime atomically.");
 
 var emptyActivity = new EmptyActivitySeriesProvider().GetSnapshot(new DateTime(2026, 9, 8, 10, 0, 0));
 AssertEqual(emptyActivity.ActivityScore, null, "Unavailable activity score must not be fabricated.");
@@ -200,6 +203,20 @@ AssertEqual(
     visualStudioUsage.ActiveForegroundDuration,
     TimeSpan.FromMinutes(12),
     "Active foreground usage must exclude inactive time.");
+appUsage.Add(
+    new DateOnly(2026, 9, 8),
+    "WorkMate",
+    TimeSpan.FromMinutes(5),
+    TimeSpan.FromMinutes(5));
+AssertEqual(
+    appUsage.GetForDate(new DateOnly(2026, 9, 8)).Count,
+    1,
+    "WorkMate must not be persisted as a user application.");
+var externalSwitches = new ExternalAppSwitchTracker();
+AssertEqual(externalSwitches.Observe("chrome", false), false, "The initial external app is a baseline.");
+AssertEqual(externalSwitches.Observe("WorkMate"), false, "Opening WorkMate must not count as an app switch.");
+AssertEqual(externalSwitches.Observe("devenv"), true, "Chrome to WorkMate to VS should count as one external app switch.");
+AssertEqual(externalSwitches.Observe("DEVENV"), false, "The same normalized process name is not a new app switch.");
 
 var aggregator = new ActivityAggregator();
 aggregator.Add(new ActivityAggregationSample(
@@ -220,6 +237,62 @@ AssertEqual(previousDayBucket.KeyboardCount, 5L, "A midnight-spanning input slic
 AssertEqual(nextDayBucket.KeyboardCount, 5L, "The new day must receive only its half of the slice.");
 AssertEqual(previousDayBucket.OvertimeSeconds, 5d, "Work duration must split at midnight.");
 AssertEqual(nextDayBucket.OvertimeSeconds, 5d, "Work duration after midnight belongs to the new day.");
+AssertDiscreteAllocation(1, 0, 0, 0, false, "One keyboard event across a bucket boundary must be conserved.");
+AssertDiscreteAllocation(3, 0, 0, 0, false, "Three keyboard events across a bucket boundary must be conserved.");
+AssertDiscreteAllocation(0, 1, 0, 0, false, "One mouse click across a bucket boundary must be conserved.");
+AssertDiscreteAllocation(0, 0, 0, 1, false, "One app switch across a bucket boundary must be conserved.");
+AssertDiscreteAllocation(1, 1, 1, 1, true, "Discrete events across midnight must be conserved.");
+
+var nonWorkAggregator = new ActivityAggregator();
+nonWorkAggregator.Add(new ActivityAggregationSample(
+    new DateTime(2026, 9, 8, 11, 30, 0),
+    new DateTime(2026, 9, 8, 11, 35, 0),
+    new ActivityInputDelta(100, 20, 0, 0, 5, 1_000),
+    UserActivityState.Active,
+    2,
+    "chrome",
+    WorkScheduleState.Lunch,
+    ActivityMode.Computer,
+    WorkTimeCategory.None,
+    80,
+    90));
+var lunchActivityBucket = nonWorkAggregator.GetBuckets(new DateOnly(2026, 9, 8)).Single();
+if (lunchActivityBucket.ActivityScore <= 0)
+{
+    throw new InvalidOperationException("Lunch computer activity should still produce ActivityScore.");
+}
+
+AssertEqual(lunchActivityBucket.WorkIntensity, 0d, "Lunch activity must not contribute WorkIntensity.");
+nonWorkAggregator.Add(new ActivityAggregationSample(
+    new DateTime(2026, 9, 8, 17, 30, 0),
+    new DateTime(2026, 9, 8, 17, 35, 0),
+    new ActivityInputDelta(100, 20, 0, 0, 5, 1_000),
+    UserActivityState.Active,
+    2,
+    "chrome",
+    WorkScheduleState.OffWork,
+    ActivityMode.Computer,
+    WorkTimeCategory.None,
+    80,
+    90));
+var offWorkActivityBucket = nonWorkAggregator.GetBuckets(new DateOnly(2026, 9, 8))
+    .Single(static bucket => bucket.BucketStart.Hour == 17);
+AssertEqual(offWorkActivityBucket.WorkIntensity, 0d, "Off-work activity must not contribute WorkIntensity.");
+nonWorkAggregator.Add(new ActivityAggregationSample(
+    new DateTime(2026, 9, 8, 18, 0, 0),
+    new DateTime(2026, 9, 8, 18, 5, 0),
+    new ActivityInputDelta(100, 20, 0, 0, 5, 1_000),
+    UserActivityState.Active,
+    2,
+    "devenv",
+    WorkScheduleState.Overtime,
+    ActivityMode.Computer,
+    WorkTimeCategory.Overtime,
+    80,
+    70));
+var overtimeIntensityBucket = nonWorkAggregator.GetBuckets(new DateOnly(2026, 9, 8))
+    .Single(static bucket => bucket.BucketStart.Hour == 18);
+AssertEqual(overtimeIntensityBucket.WorkIntensity, 70d, "Overtime work must restore WorkIntensity aggregation.");
 
 var twoHourAggregator = new ActivityAggregator();
 var twoHourStart = new DateTime(2026, 9, 8, 8, 0, 0);
@@ -311,6 +384,7 @@ var labBuckets = manualModeAggregator.GetBuckets(new DateOnly(2026, 9, 8));
 AssertEqual(labBuckets.Sum(static bucket => bucket.LabSeconds), 1_800d, "Thirty AFK minutes in LAB must count as lab time.");
 AssertEqual(labBuckets.Sum(static bucket => bucket.ManualWorkSeconds), 1_800d, "LAB must add to manual work exactly once.");
 AssertEqual(labBuckets.Sum(static bucket => bucket.NormalWorkSeconds), 0d, "LAB must not also add normal work.");
+AssertEqual(labBuckets.All(static bucket => bucket.WorkIntensity == 20d), true, "LAB work must retain WorkIntensity.");
 
 var sessions = new WorkSessionTracker();
 var activeContext = new WorkClassificationContext(
@@ -364,6 +438,30 @@ AssertEqual(
     }),
     WorkTimeCategory.None,
     "Sleep or lock must never be classified as work, including manual modes.");
+
+var availabilityState = new SystemAvailabilityState();
+AssertEqual(availabilityState.SetSessionLocked(true), false, "Lock must make activity unavailable.");
+AssertEqual(availabilityState.SetSuspended(true), false, "Suspend while locked must remain unavailable.");
+AssertEqual(availabilityState.SetSessionLocked(false), false, "Unlock while suspended must remain unavailable.");
+AssertEqual(availabilityState.SetSuspended(false), true, "Activity resumes only after unlock and resume.");
+
+var standCycle = new StandReminderCycle();
+AssertEqual(
+    standCycle.Advance(TimeSpan.FromMinutes(50), true, TimeSpan.FromMinutes(50)),
+    true,
+    "Stand reminder should become due after one complete active cycle.");
+standCycle.Complete();
+AssertEqual(
+    standCycle.Advance(TimeSpan.FromMinutes(50), true, TimeSpan.FromMinutes(50)),
+    true,
+    "Completing a stand reminder must start a new full reminder cycle.");
+standCycle.Reset();
+standCycle.Advance(TimeSpan.FromMinutes(40), true, TimeSpan.FromMinutes(50));
+standCycle.Reset();
+AssertEqual(
+    standCycle.Advance(TimeSpan.FromMinutes(10), true, TimeSpan.FromMinutes(50)),
+    false,
+    "AFK, lunch, off-work, sleep, and lock resets must discard the previous stand interval.");
 
 var intensityCalculator = new WorkIntensityCalculator();
 var quietIntensity = intensityCalculator.Calculate(new ActivityIntensityInput(
@@ -524,6 +622,13 @@ try
 
     var database = new DatabaseStore(databasePath);
     await database.InitializeAsync(CancellationToken.None);
+    await using (var schemaConnection = new SqliteConnection($"Data Source={databasePath}"))
+    {
+        await schemaConnection.OpenAsync();
+        var schemaCommand = schemaConnection.CreateCommand();
+        schemaCommand.CommandText = "PRAGMA user_version;";
+        AssertEqual(Convert.ToInt32(await schemaCommand.ExecuteScalarAsync()), 3, "Database migrations must finish at schema version 3.");
+    }
     await database.UpsertActivityBucketsAsync(
         new[] { previousDayBucket, nextDayBucket },
         CancellationToken.None);
@@ -539,8 +644,36 @@ try
         new DateOnly(2026, 9, 8),
         CancellationToken.None);
     AssertEqual(restoredUsage.Single().ProcessName, "devenv", "App usage should round-trip by process name.");
+    await database.UpsertAppUsageAsync(
+        [new AppUsageEntry(
+            new DateOnly(2026, 9, 8),
+            "WorkMate",
+            TimeSpan.FromMinutes(5),
+            TimeSpan.FromMinutes(5))],
+        CancellationToken.None);
+    AssertEqual(
+        (await database.GetAppUsageAsync(new DateOnly(2026, 9, 8), CancellationToken.None)).Count,
+        1,
+        "WorkMate self usage must not be written to or returned from app_usage_daily.");
     using var engine = new ScheduleEngine(new ScheduleSettingsStore(database));
     await engine.InitializeAsync(CancellationToken.None);
+    using (var concurrentActivity = new ActivitySnapshotService(
+               database,
+               engine,
+               new WorkModeService()))
+    {
+        await concurrentActivity.InitializeAsync(CancellationToken.None);
+        await Task.WhenAll(
+            concurrentActivity.FlushAsync(CancellationToken.None),
+            concurrentActivity.SetSystemAvailableAsync(false));
+        AssertEqual(
+            concurrentActivity.Current.UserState,
+            UserActivityState.Afk,
+            "A concurrent Tick/Lock transition must publish an unavailable AFK snapshot without racing.");
+        await concurrentActivity.SetSystemAvailableAsync(true);
+        await concurrentActivity.FlushAsync(CancellationToken.None);
+    }
+
     using var presentation = new TestReminderPresentationService();
     var reminderWorkMode = new WorkModeService();
     using var reminders = new ReminderEngine(
@@ -788,6 +921,60 @@ try
     {
         throw new InvalidOperationException("Reminder shown time must be persisted.");
     }
+
+    var ordinaryType = "Drink:100000";
+    AssertEqual(
+        await database.TryClaimReminderAsync(ordinaryType, historyDate, shownAt, "喝水", CancellationToken.None),
+        true,
+        "An ordinary reminder should be claimable before snoozing.");
+    var ordinaryDueAt = DateTimeOffset.Now.AddMinutes(10);
+    AssertEqual(
+        await database.TrySnoozeReminderAsync(ordinaryType, historyDate, ordinaryDueAt, 1, CancellationToken.None),
+        true,
+        "An ordinary reminder snooze must be persisted.");
+    var reopenedSnoozeDatabase = new DatabaseStore(databasePath);
+    var restoredSnoozes = await reopenedSnoozeDatabase.GetSnoozedOrdinaryRemindersAsync(historyDate, CancellationToken.None);
+    AssertEqual(restoredSnoozes.Count, 1, "Ordinary snoozes must be restored after restarting the database store.");
+    AssertEqual(restoredSnoozes[0].NextDueAt is not null, true, "Restored ordinary snooze must retain next_due_at.");
+
+    var preemptedType = "Schedule.Preempted.Test";
+    AssertEqual(
+        await database.TryClaimReminderAsync(preemptedType, historyDate, shownAt, "测试", CancellationToken.None),
+        true,
+        "A reminder should be claimable before preemption.");
+    await database.RecordReminderActionAsync(
+        preemptedType,
+        historyDate,
+        ReminderAction.Preempted.ToString(),
+        ReminderHistoryStatus.Preempted,
+        shownAt,
+        CancellationToken.None);
+    var preemptedHistory = await database.GetReminderHistoryAsync(preemptedType, historyDate, CancellationToken.None);
+    AssertEqual(preemptedHistory?.Status, ReminderHistoryStatus.Preempted, "Preempted reminders must not be recorded as dismissed.");
+
+    var expiredDate = DateOnly.FromDateTime(DateTime.Now);
+    var expiredType = "Stand:expired-test";
+    var expiredAt = DateTimeOffset.Now.AddMinutes(-5);
+    await database.TryClaimReminderAsync(expiredType, expiredDate, expiredAt, "站立", CancellationToken.None);
+    await database.TrySnoozeReminderAsync(expiredType, expiredDate, expiredAt, 1, CancellationToken.None);
+    using (var expiryPresentation = new TestReminderPresentationService())
+    using (var expiryEngine = new ReminderEngine(
+               engine,
+               new CleaningReminderSettingsStore(database),
+               new ReminderPresentationSettingsStore(database),
+               database,
+               expiryPresentation,
+               new WorkModeService()))
+    {
+        await expiryEngine.InitializeAsync(CancellationToken.None);
+        await Task.Delay(TimeSpan.FromSeconds(1.5));
+    }
+
+    var expiredHistory = await database.GetReminderHistoryAsync(expiredType, expiredDate, CancellationToken.None);
+    AssertEqual(expiredHistory?.Status, ReminderHistoryStatus.Expired, "Expired ordinary snoozes must be marked Expired by the polling engine.");
+
+    reminders.Dispose();
+    reminders.Dispose();
 }
 finally
 {
@@ -839,6 +1026,41 @@ static void AssertState(ScheduleSettings settings, DateTime timestamp, WorkSched
     AssertEqual(ScheduleEvaluator.Evaluate(settings, timestamp).State, expected, $"Unexpected state at {timestamp:O}.");
 }
 
+static void AssertDiscreteAllocation(
+    long keyboardCount,
+    long mouseClickCount,
+    long scrollCount,
+    int appSwitchCount,
+    bool crossMidnight,
+    string message)
+{
+    var aggregator = new ActivityAggregator();
+    var start = crossMidnight
+        ? new DateTime(2026, 9, 8, 23, 59, 59)
+        : new DateTime(2026, 9, 8, 10, 4, 59);
+    var end = start.AddSeconds(2);
+    aggregator.Add(new ActivityAggregationSample(
+        start,
+        end,
+        new ActivityInputDelta(keyboardCount, mouseClickCount, 0, 0, scrollCount, 10),
+        UserActivityState.Active,
+        appSwitchCount,
+        "devenv",
+        WorkScheduleState.Working,
+        ActivityMode.Computer,
+        WorkTimeCategory.Normal,
+        50,
+        50));
+    var dates = crossMidnight
+        ? new[] { new DateOnly(2026, 9, 8), new DateOnly(2026, 9, 9) }
+        : new[] { new DateOnly(2026, 9, 8) };
+    var buckets = dates.SelectMany(aggregator.GetBuckets).ToArray();
+    AssertEqual(buckets.Sum(static bucket => bucket.KeyboardCount), keyboardCount, message);
+    AssertEqual(buckets.Sum(static bucket => bucket.MouseClickCount), mouseClickCount, message);
+    AssertEqual(buckets.Sum(static bucket => bucket.ScrollCount), scrollCount, message);
+    AssertEqual(buckets.Sum(static bucket => bucket.AppSwitchCount), appSwitchCount, message);
+}
+
 static void AssertEqual<T>(T actual, T expected, string message)
 {
     if (!EqualityComparer<T>.Default.Equals(actual, expected))
@@ -870,9 +1092,10 @@ sealed class TestActivitySnapshotService : IActivitySnapshotService
 
     public Task FlushAsync(CancellationToken cancellationToken) => Task.CompletedTask;
 
-    public void SetSystemAvailable(bool available)
+    public Task SetSystemAvailableAsync(bool available, CancellationToken cancellationToken = default)
     {
         _ = available;
+        return Task.CompletedTask;
     }
 
     public ActivityDashboardSnapshot GetSnapshot(DateTime now)

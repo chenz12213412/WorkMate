@@ -2,7 +2,7 @@
 
 ## Current Phase
 
-TTS Natural Voice Pass 已完成；V0.2 活动闭环、提醒触发与 Dashboard 结构保持不变，进入发布候选验证。
+V0.2.1 P1 stabilization completed；S1～S5 数据正确性、并发状态转换和提醒周期修复已完成，停在 P1 Checkpoint 验证。
 
 ## Completed
 
@@ -96,11 +96,27 @@ TTS Natural Voice Pass 已完成；V0.2 活动闭环、提醒触发与 Dashboard
 - 新增 SpeechTemplateProvider，为喝水、站立、午休、下午上班、下班、加班和打扫卫生提供 3～5 条温和模板，避免同类语音连续重复。
 - Speech Queue 保持单通道；Lock、Sleep、禁用语音和高优先级抢占会取消当前播报，并使尚未开始的旧播报失效。
 - 8 类代表性语音已使用本机 Microsoft Huihui zh-CN Voice 依次完成实际播放，未发生并发叠音。
+- V0.2.1 S1：Activity Sample 跨 5 分钟或午夜时，键盘、鼠标点击、滚轮和应用切换采用 Largest Remainder 整数分配，总数严格守恒。
+- V0.2.1 S2：Foreground Hook 接收 WorkMate 自身前台事件以准确结束前一个应用区间；WorkMate 不写入 AppUsage、TopApplications 或 DominantProcess。
+- V0.2.1 S2：应用切换改为外部标准化 ProcessName 变化；Chrome → WorkMate → Visual Studio 只计一次外部应用切换。
+- V0.2.1 S3：Tick、Lock、Unlock、Suspend、Resume、Flush 共用 Activity Semaphore；系统组合状态按事件顺序排队，只有未锁定且未挂起时恢复 Timer。
+- V0.2.1 S4：站立提醒改用独立 ActiveStand 周期；完成后重新计时，AFK、午休、下班、Sleep、Lock 和 LAB 会重置，Snooze 不视为完成。
+- V0.2.1 S5：ActivityScore 继续覆盖电脑活动；WorkIntensity 只对 Normal、Overtime、Lab、Meeting 加权，非工作 Bucket 不进入 Dashboard 当前值或 Sparkline。
+- V0.2.1 P1 回归检查覆盖离散事件守恒、WorkMate 自身排除、外部 AppSwitch、Lock/Suspend 组合、Tick/Lock 串行化、Stand 重复周期和非工作强度隔离。
+- V0.2.1 P2 H1：普通喝水/站立 Snooze 写入 `reminder_history.next_due_at`，启动后由 ReminderEngine 轮询恢复；超过宽限期的 Snooze 标记为 Expired，不依赖 Task.Delay 作为唯一触发源。
+- V0.2.1 P2 H2：提醒被高优先级 Schedule Reminder 抢占时记录 Preempted，并在仍未过期时重新排队，不再误记为 Dismissed。
+- V0.2.1 P2 H3：外部 AppSwitch 使用标准化 ProcessName 语义；P1 已完成并纳入回归检查。
+- V0.2.1 P2 H4：WorkModeService 提供锁保护的不可变 WorkModeSnapshot，采样 Tick 使用同一快照读取 ActivityMode 与 Overtime。
+- V0.2.1 P2 H5：ReminderEngine、ReminderPresentationService、SpeechService、ActivitySnapshotService 的 Dispose 改为可重复调用并避免 CTS/信号量释放竞态。
+- V0.2.1 P2 H6：DatabaseStore 使用 PRAGMA user_version=3 的顺序迁移；旧 V0.2 数据保留，新增列在事务内补齐。
+- V0.2.1 P2 H7：ScheduleChecks 扩展 Snooze 重启恢复、Preempted、WorkModeSnapshot、Schema Version 和双重 Dispose 回归检查。
+- V0.2.1 P2 H8：新增 `.github/workflows/build.yml`，默认执行 Windows Release Build、ScheduleChecks；UI Capture 不纳入无头 CI。
 
 ## Known Issues
 
 - Self-contained 单文件运行时的 Working Set 可能高于 100 MB；Private Memory 仍以低于 100 MB 为优先目标。
 - 已完成 30.5 分钟实机资源测试和 2 小时等效聚合测试；完整 2 小时实时时钟 Soak 仍建议在发布候选机继续执行。
+- GitHub Actions 需要在仓库启用后由远端 Windows Runner 执行；本地已使用相同 Release Build 与 ScheduleChecks 命令验证。
 
 ## UI Decisions
 
@@ -110,4 +126,4 @@ TTS Natural Voice Pass 已完成；V0.2 活动闭环、提醒触发与 Dashboard
 
 ## Next Step
 
-在发布候选机继续执行 2 小时以上实时时钟 Soak，并对真实 Lock / Sleep、午休和下班边界提醒做人工验收。
+V0.2.1 P2 H1～H8 已在本地完成，下一步是提交分支并在 GitHub Actions 上确认 Windows Runner 结果。

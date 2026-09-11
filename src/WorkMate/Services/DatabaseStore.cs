@@ -44,12 +44,14 @@ public sealed class DatabaseStore
             await using var connection = new SqliteConnection(_connectionString);
             await connection.OpenAsync(cancellationToken);
 
-            var command = connection.CreateCommand();
-            command.CommandText = """
-                PRAGMA journal_mode = WAL;
-                PRAGMA synchronous = NORMAL;
-                PRAGMA busy_timeout = 5000;
+            var pragma = connection.CreateCommand();
+            pragma.CommandText = "PRAGMA journal_mode = WAL; PRAGMA synchronous = NORMAL; PRAGMA busy_timeout = 5000;";
+            await pragma.ExecuteNonQueryAsync(cancellationToken);
 
+            await using var transaction = (SqliteTransaction)await connection.BeginTransactionAsync(cancellationToken);
+            var command = connection.CreateCommand();
+            command.Transaction = transaction;
+            command.CommandText = """
                 CREATE TABLE IF NOT EXISTS app_settings (
                     key TEXT PRIMARY KEY,
                     value TEXT NOT NULL,
@@ -134,24 +136,47 @@ public sealed class DatabaseStore
                 );
                 """;
             await command.ExecuteNonQueryAsync(cancellationToken);
-            await EnsureColumnAsync(
-                connection,
-                "activity_buckets",
-                "longest_continuous_seconds",
-                "REAL NOT NULL DEFAULT 0",
-                cancellationToken);
-            await EnsureColumnAsync(
-                connection,
-                "reminder_history",
-                "shown_at",
-                "TEXT NULL",
-                cancellationToken);
-            await EnsureColumnAsync(
-                connection,
-                "reminder_history",
-                "action",
-                "TEXT NULL",
-                cancellationToken);
+
+            var schemaVersion = await GetSchemaVersionAsync(connection, transaction, cancellationToken);
+            if (schemaVersion < 1)
+            {
+                await SetSchemaVersionAsync(connection, transaction, 1, cancellationToken);
+                schemaVersion = 1;
+            }
+
+            if (schemaVersion < 2)
+            {
+                await EnsureColumnAsync(
+                    connection,
+                    transaction,
+                    "activity_buckets",
+                    "longest_continuous_seconds",
+                    "REAL NOT NULL DEFAULT 0",
+                    cancellationToken);
+                await SetSchemaVersionAsync(connection, transaction, 2, cancellationToken);
+                schemaVersion = 2;
+            }
+
+            if (schemaVersion < 3)
+            {
+                await EnsureColumnAsync(
+                    connection,
+                    transaction,
+                    "reminder_history",
+                    "shown_at",
+                    "TEXT NULL",
+                    cancellationToken);
+                await EnsureColumnAsync(
+                    connection,
+                    transaction,
+                    "reminder_history",
+                    "action",
+                    "TEXT NULL",
+                    cancellationToken);
+                await SetSchemaVersionAsync(connection, transaction, 3, cancellationToken);
+            }
+
+            await transaction.CommitAsync(cancellationToken);
             _initialized = true;
         }
         finally
@@ -159,6 +184,57 @@ public sealed class DatabaseStore
             _initializationLock.Release();
         }
     }
+
+    private static async Task<int> GetSchemaVersionAsync(
+        SqliteConnection connection,
+        SqliteTransaction transaction,
+        CancellationToken cancellationToken)
+    {
+        var command = connection.CreateCommand();
+        command.Transaction = transaction;
+        command.CommandText = "PRAGMA user_version;";
+        return Convert.ToInt32(await command.ExecuteScalarAsync(cancellationToken), CultureInfo.InvariantCulture);
+    }
+
+    private static async Task SetSchemaVersionAsync(
+        SqliteConnection connection,
+        SqliteTransaction transaction,
+        int version,
+        CancellationToken cancellationToken)
+    {
+        var command = connection.CreateCommand();
+        command.Transaction = transaction;
+        command.CommandText = $"PRAGMA user_version = {version};";
+        await command.ExecuteNonQueryAsync(cancellationToken);
+    }
+
+    private static async Task EnsureColumnAsync(
+        SqliteConnection connection,
+        SqliteTransaction transaction,
+        string tableName,
+        string columnName,
+        string declaration,
+        CancellationToken cancellationToken)
+    {
+        var check = connection.CreateCommand();
+        check.Transaction = transaction;
+        check.CommandText = $"PRAGMA table_info({tableName});";
+        await using var reader = await check.ExecuteReaderAsync(cancellationToken);
+        while (await reader.ReadAsync(cancellationToken))
+        {
+            if (string.Equals(reader.GetString(1), columnName, StringComparison.OrdinalIgnoreCase))
+            {
+                return;
+            }
+        }
+
+        await reader.DisposeAsync();
+        var alter = connection.CreateCommand();
+        alter.Transaction = transaction;
+        alter.CommandText = $"ALTER TABLE {tableName} ADD COLUMN {columnName} {declaration};";
+        await alter.ExecuteNonQueryAsync(cancellationToken);
+    }
+
 
     public async Task<string?> GetSettingAsync(string key, CancellationToken cancellationToken)
     {
@@ -259,6 +335,44 @@ public sealed class DatabaseStore
                 ? null
                 : DateTimeOffset.Parse(reader.GetString(4), CultureInfo.InvariantCulture),
             reader.IsDBNull(5) ? null : reader.GetString(5));
+    }
+
+    public async Task<IReadOnlyList<ReminderHistoryEntry>> GetSnoozedOrdinaryRemindersAsync(
+        DateOnly date,
+        CancellationToken cancellationToken)
+    {
+        await EnsureInitializedAsync(cancellationToken);
+        await using var connection = new SqliteConnection(_connectionString);
+        await connection.OpenAsync(cancellationToken);
+        var command = connection.CreateCommand();
+        command.CommandText = """
+            SELECT reminder_type, status, snooze_count, next_due_at, message, shown_at, action
+            FROM reminder_history
+            WHERE reminder_date = $date
+              AND status = 'Snoozed'
+              AND (reminder_type LIKE 'Drink:%' OR reminder_type LIKE 'Stand:%');
+            """;
+        command.Parameters.AddWithValue("$date", FormatDate(date));
+        var result = new List<ReminderHistoryEntry>();
+        await using var reader = await command.ExecuteReaderAsync(cancellationToken);
+        while (await reader.ReadAsync(cancellationToken))
+        {
+            result.Add(new ReminderHistoryEntry(
+                reader.GetString(0),
+                date,
+                ReminderHistoryStatus.Snoozed,
+                reader.GetInt32(2),
+                reader.IsDBNull(3)
+                    ? null
+                    : DateTimeOffset.Parse(reader.GetString(3), CultureInfo.InvariantCulture),
+                reader.IsDBNull(4) ? null : reader.GetString(4),
+                reader.IsDBNull(5)
+                    ? null
+                    : DateTimeOffset.Parse(reader.GetString(5), CultureInfo.InvariantCulture),
+                reader.IsDBNull(6) ? null : reader.GetString(6)));
+        }
+
+        return result;
     }
 
     public async Task RecordReminderShownAsync(
@@ -563,7 +677,9 @@ public sealed class DatabaseStore
         CancellationToken cancellationToken)
     {
         await EnsureInitializedAsync(cancellationToken);
-        var items = entries.ToArray();
+        var items = entries
+            .Where(static entry => ApplicationProcessPolicy.ShouldPersistApplication(entry.ProcessName))
+            .ToArray();
         if (items.Length == 0)
         {
             return;
@@ -617,9 +733,15 @@ public sealed class DatabaseStore
         await using var reader = await command.ExecuteReaderAsync(cancellationToken);
         while (await reader.ReadAsync(cancellationToken))
         {
+            var processName = reader.GetString(0);
+            if (!ApplicationProcessPolicy.ShouldPersistApplication(processName))
+            {
+                continue;
+            }
+
             result.Add(new AppUsageEntry(
                 date,
-                reader.GetString(0),
+                processName,
                 TimeSpan.FromSeconds(reader.GetDouble(1)),
                 TimeSpan.FromSeconds(reader.GetDouble(2))));
         }
@@ -704,27 +826,4 @@ public sealed class DatabaseStore
         return _initialized ? Task.CompletedTask : InitializeAsync(cancellationToken);
     }
 
-    private static async Task EnsureColumnAsync(
-        SqliteConnection connection,
-        string tableName,
-        string columnName,
-        string declaration,
-        CancellationToken cancellationToken)
-    {
-        var check = connection.CreateCommand();
-        check.CommandText = $"PRAGMA table_info({tableName});";
-        await using var reader = await check.ExecuteReaderAsync(cancellationToken);
-        while (await reader.ReadAsync(cancellationToken))
-        {
-            if (string.Equals(reader.GetString(1), columnName, StringComparison.OrdinalIgnoreCase))
-            {
-                return;
-            }
-        }
-
-        await reader.DisposeAsync();
-        var alter = connection.CreateCommand();
-        alter.CommandText = $"ALTER TABLE {tableName} ADD COLUMN {columnName} {declaration};";
-        await alter.ExecuteNonQueryAsync(cancellationToken);
-    }
 }

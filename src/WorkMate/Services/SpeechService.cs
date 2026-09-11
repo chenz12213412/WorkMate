@@ -12,7 +12,7 @@ public sealed class SpeechService : IDisposable
     private int _ratePreset;
     private string? _voiceName;
     private long _stopGeneration;
-    private bool _disposed;
+    private int _disposeState;
 
     public SpeechService()
         : this(new SapiSpeechEngine())
@@ -30,6 +30,11 @@ public sealed class SpeechService : IDisposable
 
     public void UpdateSettings(bool enabled, int volume, int rate, string? voiceName = null)
     {
+        if (Volatile.Read(ref _disposeState) != 0)
+        {
+            return;
+        }
+
         _enabled = enabled;
         _volume = Math.Clamp(volume, 0, 100);
         _ratePreset = Math.Clamp(rate, -1, 1);
@@ -42,7 +47,7 @@ public sealed class SpeechService : IDisposable
 
     public async Task SpeakAsync(string text, CancellationToken cancellationToken)
     {
-        if (!_enabled || string.IsNullOrWhiteSpace(text) || _disposed)
+        if (!_enabled || string.IsNullOrWhiteSpace(text) || Volatile.Read(ref _disposeState) != 0)
         {
             return;
         }
@@ -51,7 +56,7 @@ public sealed class SpeechService : IDisposable
         await _speechLock.WaitAsync(cancellationToken);
         try
         {
-            if (!_enabled || _disposed || generation != Volatile.Read(ref _stopGeneration))
+            if (!_enabled || Volatile.Read(ref _disposeState) != 0 || generation != Volatile.Read(ref _stopGeneration))
             {
                 return;
             }
@@ -93,7 +98,7 @@ public sealed class SpeechService : IDisposable
     public void Stop()
     {
         Interlocked.Increment(ref _stopGeneration);
-        if (!_disposed)
+        if (Volatile.Read(ref _disposeState) == 0)
         {
             _engine.Stop();
         }
@@ -108,15 +113,15 @@ public sealed class SpeechService : IDisposable
 
     public void Dispose()
     {
-        if (_disposed)
+        if (Interlocked.Exchange(ref _disposeState, 1) != 0)
         {
             return;
         }
 
-        Stop();
-        _disposed = true;
+        Interlocked.Increment(ref _stopGeneration);
+        _engine.Stop();
         _engine.Dispose();
-        _speechLock.Dispose();
+        // 不释放信号量：可能仍有一个正在等待的语音任务，避免 Dispose 竞态。
     }
 
     private static int MapRate(int preset)

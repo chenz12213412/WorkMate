@@ -2,6 +2,37 @@ using WorkMate.Models;
 
 namespace WorkMate.Services;
 
+public static class ApplicationProcessPolicy
+{
+    public static bool IsWorkMateProcess(string? processName) =>
+        string.Equals(processName?.Trim(), "WorkMate", StringComparison.OrdinalIgnoreCase);
+
+    public static bool ShouldPersistApplication(string? processName) =>
+        !string.IsNullOrWhiteSpace(processName) && !IsWorkMateProcess(processName);
+
+    public static string Normalize(string processName) => processName.Trim().ToUpperInvariant();
+}
+
+public sealed class ExternalAppSwitchTracker
+{
+    private string? _lastExternalProcess;
+
+    public bool Observe(string? processName, bool countSwitch = true)
+    {
+        if (!ApplicationProcessPolicy.ShouldPersistApplication(processName))
+        {
+            return false;
+        }
+
+        var normalizedProcess = ApplicationProcessPolicy.Normalize(processName!);
+        var changed = countSwitch &&
+                      _lastExternalProcess is not null &&
+                      !string.Equals(_lastExternalProcess, normalizedProcess, StringComparison.Ordinal);
+        _lastExternalProcess = normalizedProcess;
+        return changed;
+    }
+}
+
 public sealed class AppUsageService
 {
     private readonly object _syncRoot = new();
@@ -13,12 +44,13 @@ public sealed class AppUsageService
         TimeSpan foregroundDuration,
         TimeSpan activeForegroundDuration)
     {
-        if (string.IsNullOrWhiteSpace(processName) || foregroundDuration <= TimeSpan.Zero)
+        if (!ApplicationProcessPolicy.ShouldPersistApplication(processName) ||
+            foregroundDuration <= TimeSpan.Zero)
         {
             return;
         }
 
-        var normalizedName = processName.Trim();
+        var normalizedName = processName!.Trim();
         lock (_syncRoot)
         {
             var key = (date, normalizedName);
@@ -40,7 +72,8 @@ public sealed class AppUsageService
         lock (_syncRoot)
         {
             return _usage
-                .Where(pair => pair.Key.Date == date)
+                .Where(pair => pair.Key.Date == date &&
+                               ApplicationProcessPolicy.ShouldPersistApplication(pair.Key.Process))
                 .Select(pair => new AppUsageEntry(
                     pair.Key.Date,
                     pair.Key.Process,
@@ -57,6 +90,11 @@ public sealed class AppUsageService
         {
             foreach (var entry in entries)
             {
+                if (!ApplicationProcessPolicy.ShouldPersistApplication(entry.ProcessName))
+                {
+                    continue;
+                }
+
                 _usage[(entry.Date, entry.ProcessName)] = new MutableUsage
                 {
                     ForegroundSeconds = entry.ForegroundDuration.TotalSeconds,

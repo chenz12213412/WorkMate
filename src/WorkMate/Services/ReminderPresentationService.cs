@@ -32,7 +32,7 @@ public sealed class ReminderPresentationService : IReminderPresentationService
     private long _sequence;
     private int _processing;
     private bool _systemAvailable = true;
-    private bool _disposed;
+    private int _disposeState;
     private ReminderPresentationSettings _settings = ReminderPresentationSettings.Default;
 
     public ReminderPresentationService(
@@ -51,6 +51,11 @@ public sealed class ReminderPresentationService : IReminderPresentationService
 
     public void ApplySettings(ReminderPresentationSettings settings)
     {
+        if (Volatile.Read(ref _disposeState) != 0)
+        {
+            return;
+        }
+
         _settings = settings;
         _speechService.UpdateSettings(
             settings.GlobalSpeechEnabled,
@@ -62,7 +67,7 @@ public sealed class ReminderPresentationService : IReminderPresentationService
     public Task EnqueueAsync(ReminderPresentationRequest request, CancellationToken cancellationToken)
     {
         cancellationToken.ThrowIfCancellationRequested();
-        if (_disposed || request.ExpiresAt <= DateTimeOffset.Now)
+        if (Volatile.Read(ref _disposeState) != 0 || request.ExpiresAt <= DateTimeOffset.Now)
         {
             return Task.CompletedTask;
         }
@@ -98,7 +103,7 @@ public sealed class ReminderPresentationService : IReminderPresentationService
 
     public void SetSystemAvailable(bool available)
     {
-        if (_disposed)
+        if (Volatile.Read(ref _disposeState) != 0)
         {
             return;
         }
@@ -121,12 +126,11 @@ public sealed class ReminderPresentationService : IReminderPresentationService
 
     public void Dispose()
     {
-        if (_disposed)
+        if (Interlocked.Exchange(ref _disposeState, 1) != 0)
         {
             return;
         }
 
-        _disposed = true;
         _disposeTokenSource.Cancel();
         lock (_syncRoot)
         {
@@ -144,13 +148,12 @@ public sealed class ReminderPresentationService : IReminderPresentationService
             _dispatcher.BeginInvoke(() => _currentPopup?.CloseForPreemption());
         }
 
-        _disposeTokenSource.Dispose();
-        _queueDelayTokenSource?.Dispose();
+        // 取消即可；后台处理器可能仍在使用这些 token，避免 Dispose 竞态。
     }
 
     private void StartProcessor()
     {
-        if (_disposed || Interlocked.CompareExchange(ref _processing, 1, 0) != 0)
+        if (Volatile.Read(ref _disposeState) != 0 || Interlocked.CompareExchange(ref _processing, 1, 0) != 0)
         {
             return;
         }
@@ -162,7 +165,7 @@ public sealed class ReminderPresentationService : IReminderPresentationService
     {
         try
         {
-            while (!_disposed)
+            while (Volatile.Read(ref _disposeState) == 0)
             {
                 var request = TakeNextRequest();
                 if (request is null)
@@ -208,7 +211,7 @@ public sealed class ReminderPresentationService : IReminderPresentationService
             Volatile.Write(ref _processing, 0);
             lock (_syncRoot)
             {
-                if (!_disposed && _queue.Count > 0)
+                if (Volatile.Read(ref _disposeState) == 0 && _queue.Count > 0)
                 {
                     StartProcessor();
                 }
@@ -279,6 +282,11 @@ public sealed class ReminderPresentationService : IReminderPresentationService
             {
                 await request.HandleActionAsync(action, cancellationToken);
             }
+
+            if (action == ReminderAction.Preempted && request.ExpiresAt > DateTimeOffset.Now)
+            {
+                Requeue(request);
+            }
         }
         finally
         {
@@ -325,6 +333,11 @@ public sealed class ReminderPresentationService : IReminderPresentationService
 
     private void Requeue(ReminderPresentationRequest request)
     {
+        if (Volatile.Read(ref _disposeState) != 0 || request.ExpiresAt <= DateTimeOffset.Now)
+        {
+            return;
+        }
+
         lock (_syncRoot)
         {
             _queue.Add(new QueuedReminder(request, Interlocked.Increment(ref _sequence)));
@@ -342,7 +355,7 @@ public sealed class ReminderPresentationService : IReminderPresentationService
             _disposeTokenSource.Token);
         lock (_syncRoot)
         {
-            _queueDelayTokenSource?.Dispose();
+            _queueDelayTokenSource?.Cancel();
             _queueDelayTokenSource = delayTokenSource;
         }
 

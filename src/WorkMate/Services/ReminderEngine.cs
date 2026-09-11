@@ -44,10 +44,10 @@ public sealed class ReminderEngine : IDisposable
     private bool _allRemindersPaused;
     private DateTime _lastActivitySnapshotAt;
     private double _activeDrinkSeconds;
-    private bool _standReminderDeliveredForCurrentSession;
+    private readonly StandReminderCycle _standReminderCycle = new();
     private int _timerBusy;
     private int _ordinaryReminderBusy;
-    private bool _disposed;
+    private int _disposeState;
 
     public ReminderEngine(
         ScheduleEngine scheduleEngine,
@@ -102,18 +102,21 @@ public sealed class ReminderEngine : IDisposable
         }
 
         var scheduledState = _scheduleEngine.GetSnapshot(timestamp).State;
-        var effectiveState = _workModeService.ResolveScheduleState(scheduledState);
+        var workMode = _workModeService.Snapshot;
+        var effectiveState = workMode.IsOvertime
+            ? WorkScheduleState.Overtime
+            : scheduledState;
         if (effectiveState is not (WorkScheduleState.Working or WorkScheduleState.Overtime))
         {
             return false;
         }
 
-        if (_workModeService.ActivityMode == ActivityMode.Lab && kind == ReminderKind.Stand)
+        if (workMode.ActivityMode == ActivityMode.Lab && kind == ReminderKind.Stand)
         {
             return false;
         }
 
-        if (_workModeService.ActivityMode is ActivityMode.Lab or ActivityMode.Meeting)
+        if (workMode.ActivityMode is ActivityMode.Lab or ActivityMode.Meeting)
         {
             return true;
         }
@@ -134,7 +137,7 @@ public sealed class ReminderEngine : IDisposable
 
     public void MarkStandCompleted()
     {
-        _standReminderDeliveredForCurrentSession = true;
+        _standReminderCycle.Complete();
         AvailabilityChanged?.Invoke(this, EventArgs.Empty);
     }
 
@@ -287,12 +290,11 @@ public sealed class ReminderEngine : IDisposable
 
     public void Dispose()
     {
-        if (_disposed)
+        if (Interlocked.Exchange(ref _disposeState, 1) != 0)
         {
             return;
         }
 
-        _disposed = true;
         _disposeTokenSource.Cancel();
         _scheduleEngine.StateChanged -= ScheduleEngine_OnStateChanged;
         _scheduleEngine.SettingsReloaded -= ScheduleEngine_OnSettingsReloaded;
@@ -303,7 +305,7 @@ public sealed class ReminderEngine : IDisposable
         }
 
         _timer.Dispose();
-        _disposeTokenSource.Dispose();
+        // 保留 CTS 至所有已排队回调观察到取消，避免定时器回调与 Dispose 竞态。
     }
 
     private static ScheduleProfile? GetProfileForWorkday(ScheduleSettings settings, DateOnly date)
@@ -319,7 +321,7 @@ public sealed class ReminderEngine : IDisposable
 
     private async void OnTimer(object? state)
     {
-        if (_disposed || Interlocked.Exchange(ref _timerBusy, 1) != 0)
+        if (Volatile.Read(ref _disposeState) != 0 || Interlocked.Exchange(ref _timerBusy, 1) != 0)
         {
             return;
         }
@@ -327,6 +329,7 @@ public sealed class ReminderEngine : IDisposable
         try
         {
             var now = DateTimeOffset.Now;
+            await ProcessOrdinarySnoozesAsync(now, _disposeTokenSource.Token);
             await ProcessScheduleRemindersAsync(now, _disposeTokenSource.Token);
             await ProcessCleaningReminderAsync(now, _disposeTokenSource.Token);
         }
@@ -393,6 +396,58 @@ public sealed class ReminderEngine : IDisposable
             {
                 await _presentationService.EnqueueAsync(request, cancellationToken);
             }
+        }
+    }
+
+    private async Task ProcessOrdinarySnoozesAsync(
+        DateTimeOffset now,
+        CancellationToken cancellationToken)
+    {
+        if (_allRemindersPaused)
+        {
+            return;
+        }
+
+        var date = DateOnly.FromDateTime(now.LocalDateTime);
+        var histories = await _database.GetSnoozedOrdinaryRemindersAsync(date, cancellationToken);
+        foreach (var history in histories)
+        {
+            if (history.NextDueAt is not { } dueAt || dueAt > now)
+            {
+                continue;
+            }
+
+            if (now - dueAt > MissedReminderGrace)
+            {
+                await _database.SetReminderStatusAsync(
+                    history.ReminderType,
+                    date,
+                    ReminderHistoryStatus.Expired,
+                    now,
+                    cancellationToken);
+                continue;
+            }
+
+            var kind = history.ReminderType.StartsWith("Drink:", StringComparison.OrdinalIgnoreCase)
+                ? ReminderKind.DrinkWater
+                : ReminderKind.Stand;
+            if (!CanDeliver(kind, now.LocalDateTime) ||
+                !await _database.TryConsumeSnoozedReminderAsync(
+                    history.ReminderType,
+                    date,
+                    now,
+                    cancellationToken))
+            {
+                continue;
+            }
+
+            await EnqueueOrdinaryReminderAsync(
+                kind,
+                _activitySnapshotService?.Current ?? CreateEmptyActivitySnapshot(),
+                now,
+                cancellationToken,
+                history.ReminderType,
+                skipClaim: true);
         }
     }
 
@@ -557,7 +612,7 @@ public sealed class ReminderEngine : IDisposable
         object? sender,
         ActivityDashboardSnapshot snapshot)
     {
-        if (_disposed || Interlocked.Exchange(ref _ordinaryReminderBusy, 1) != 0)
+        if (Volatile.Read(ref _disposeState) != 0 || Interlocked.Exchange(ref _ordinaryReminderBusy, 1) != 0)
         {
             return;
         }
@@ -574,15 +629,20 @@ public sealed class ReminderEngine : IDisposable
 
             if (!CanDeliver(ReminderKind.RegularWork, now))
             {
-                _standReminderDeliveredForCurrentSession = false;
+                _standReminderCycle.Reset();
                 return;
             }
 
             if (snapshot.UserState == UserActivityState.Afk &&
                 _workModeService.ActivityMode == ActivityMode.Computer)
             {
-                _standReminderDeliveredForCurrentSession = false;
+                _standReminderCycle.Reset();
                 return;
+            }
+
+            if (_workModeService.ActivityMode == ActivityMode.Lab)
+            {
+                _standReminderCycle.Reset();
             }
 
             if (snapshot.UserState == UserActivityState.Active ||
@@ -600,13 +660,16 @@ public sealed class ReminderEngine : IDisposable
                     ReminderKind.DrinkWater, snapshot, DateTimeOffset.Now, CancellationToken.None);
             }
 
-            if (_presentationSettings.StandEnabled &&
-                !_standReminderDeliveredForCurrentSession &&
-                snapshot.ContinuousWorkDuration >= TimeSpan.FromMinutes(
-                    _presentationSettings.StandContinuousMinutes) &&
+            var standDue = _presentationSettings.StandEnabled &&
+                           _workModeService.ActivityMode != ActivityMode.Lab &&
+                           _standReminderCycle.Advance(
+                               elapsed,
+                               snapshot.UserState == UserActivityState.Active ||
+                               _workModeService.ActivityMode == ActivityMode.Meeting,
+                               TimeSpan.FromMinutes(_presentationSettings.StandContinuousMinutes));
+            if (standDue &&
                 CanDeliver(ReminderKind.Stand, now))
             {
-                _standReminderDeliveredForCurrentSession = true;
                 await EnqueueOrdinaryReminderAsync(
                     ReminderKind.Stand, snapshot, DateTimeOffset.Now, CancellationToken.None);
             }
@@ -625,11 +688,13 @@ public sealed class ReminderEngine : IDisposable
         ReminderKind kind,
         ActivityDashboardSnapshot snapshot,
         DateTimeOffset now,
-        CancellationToken cancellationToken)
+        CancellationToken cancellationToken,
+        string? historyTypeOverride = null,
+        bool skipClaim = false)
     {
         var date = DateOnly.FromDateTime(now.LocalDateTime);
         var isDrink = kind == ReminderKind.DrinkWater;
-        var historyType = $"{(isDrink ? "Drink" : "Stand")}:{now:HHmmss}";
+        var historyType = historyTypeOverride ?? $"{(isDrink ? "Drink" : "Stand")}:{now:HHmmss}";
         var isMeeting = _workModeService.ActivityMode == ActivityMode.Meeting;
         var isOvertime = _workModeService.IsOvertime;
         var title = isDrink ? "喝口水吧" : "起来活动一下";
@@ -645,7 +710,7 @@ public sealed class ReminderEngine : IDisposable
         var showPopup = isDrink
             ? _presentationSettings.DrinkPopupEnabled
             : _presentationSettings.StandPopupEnabled;
-        if (!await _database.TryClaimReminderAsync(
+        if (!skipClaim && !await _database.TryClaimReminderAsync(
                 historyType, date, now, string.Empty, cancellationToken))
         {
             return;
@@ -710,7 +775,7 @@ public sealed class ReminderEngine : IDisposable
             var kind = request.Kind == ReminderPresentationKind.Drink
                 ? ReminderKind.DrinkWater
                 : ReminderKind.Stand;
-            if (_disposed || !CanDeliver(kind, DateTime.Now))
+            if (Volatile.Read(ref _disposeState) != 0 || !CanDeliver(kind, DateTime.Now))
             {
                 return;
             }
@@ -733,6 +798,20 @@ public sealed class ReminderEngine : IDisposable
             FileLogger.Write(exception);
         }
     }
+
+    private static ActivityDashboardSnapshot CreateEmptyActivitySnapshot() => new(
+        null,
+        null,
+        null,
+        null,
+        null,
+        [],
+        TimeSpan.Zero,
+        TimeSpan.Zero,
+        0,
+        null,
+        0,
+        UserActivityState.Afk);
 
     private async Task SetTodayCleaningStatusAsync(
         ReminderHistoryStatus status,
@@ -760,6 +839,7 @@ public sealed class ReminderEngine : IDisposable
                 ReminderHistoryStatus.Completed,
             ReminderAction.Snoozed => ReminderHistoryStatus.Snoozed,
             ReminderAction.Skipped => ReminderHistoryStatus.Skipped,
+            ReminderAction.Preempted => ReminderHistoryStatus.Preempted,
             _ => ReminderHistoryStatus.Dismissed
         };
         return _database.RecordReminderActionAsync(

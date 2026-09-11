@@ -41,7 +41,7 @@ public partial class ReminderPopupWindow : Window
 
     public void CloseForPreemption()
     {
-        Complete(ReminderAction.Dismissed);
+        Complete(ReminderAction.Preempted);
     }
 
     private static System.Windows.Media.ImageSource ResolveIcon(
